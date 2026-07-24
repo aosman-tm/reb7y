@@ -233,18 +233,16 @@ export default function OrdersPage() {
                   <IndexTable.Cell>
                     <BlockStack gap="050">
                       <Text as="span">{formatMoney(o.realDelivery, currency)}</Text>
-                      <Text
-                        as="span"
-                        variant="bodySm"
-                        tone={!o.delivered || o.deliveryGap < 0 ? "critical" : "subdued"}
-                      >
-                        {o.delivered
-                          ? o.deliveryGap < 0
-                            ? `lose ${formatMoney(-o.deliveryGap, currency)}`
-                            : "no delivery loss"
-                          : `lose ${formatMoney(o.realDelivery, currency)}`}
-                        {!o.delivered && o.returnDeliveryRule ? ` · ${o.returnDeliveryRule}` : ""}
-                      </Text>
+                      {o.delivered ? (
+                        <Text as="span" variant="bodySm" tone="success">
+                          charged {formatMoney(o.shippingCharged, currency)}
+                        </Text>
+                      ) : (
+                        <Text as="span" variant="bodySm" tone="critical">
+                          {`lose ${formatMoney(o.realDelivery, currency)}`}
+                          {o.returnDeliveryRule ? ` · ${o.returnDeliveryRule}` : ""}
+                        </Text>
+                      )}
                     </BlockStack>
                   </IndexTable.Cell>
                   <IndexTable.Cell>{formatMoney(o.paymentFee, currency)}</IndexTable.Cell>
