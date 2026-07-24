@@ -2,7 +2,7 @@
 
 client_id = "db9c247c216de6d8e9128fef88c9766f"
 name = "reb7y"
-application_url = "https://shopify.dev/apps/default-app-home"
+application_url = "https://reb7y-production.up.railway.app"
 embedded = true
 
 [webhooks]
@@ -13,7 +13,7 @@ api_version = "2026-10"
 scopes = "read_orders,read_products,read_locations"
 
 [auth]
-redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
+redirect_urls = [ "https://reb7y-production.up.railway.app/auth/callback", "https://reb7y-production.up.railway.app/auth/shopify/callback", "https://reb7y-production.up.railway.app/api/auth/callback" ]
 
 [build]
 automatically_update_urls_on_dev = true
