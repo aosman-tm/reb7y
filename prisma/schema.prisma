@@ -1,0 +1,214 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// ---------------------------------------------------------------------------
+// reb7y — profit & loss tracking models
+// Everything is scoped by `shop` (the myshopify.com domain) for multi-store safety.
+// ---------------------------------------------------------------------------
+
+/// A single material / part you buy (a box, bubble wrap, a card, a sticker...).
+/// Cost is expressed per `unit` so quantities on products multiply cleanly.
+model Material {
+  id                String    @id @default(cuid())
+  shop              String
+  name              String
+  unit              String    @default("piece") // built-in or custom unit name
+  costPerUnit       Float // cost of ONE unit, in the shop currency (EGP)
+  stock             Float     @default(0) // units bought / on hand
+  lowStockThreshold Float     @default(0) // warn when remaining <= this (0 = off)
+  archived          Boolean   @default(false)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  bomLines          BomLine[]
+
+  @@index([shop])
+}
+
+/// A custom measurement unit the merchant added (on top of the built-in ones).
+model CustomUnit {
+  id        String   @id @default(cuid())
+  shop      String
+  name      String
+  createdAt DateTime @default(now())
+
+  @@unique([shop, name])
+  @@index([shop])
+}
+
+/// Cost header attached to a Shopify product. Its material cost is the sum of
+/// its BomLines; `otherCost` covers anything not tracked as a material
+/// (labour, tape, handling...). One row per Shopify product per shop.
+model ProductCost {
+  id        String    @id @default(cuid())
+  shop      String
+  productId String // Shopify product GID, e.g. gid://shopify/Product/123
+  title     String    @default("")
+  factoryCost Float   @default(0) // manufacturing/factory cost per item in shop currency
+  otherCost Float     @default(0) // extra per-item cost (labour / misc) in EGP
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  bomLines  BomLine[]
+
+  @@unique([shop, productId])
+  @@index([shop])
+}
+
+/// One line in a product's bill of materials: "20 cm of bubble wrap".
+model BomLine {
+  id            String      @id @default(cuid())
+  productCostId String
+  productCost   ProductCost @relation(fields: [productCostId], references: [id], onDelete: Cascade)
+  materialId    String
+  material      Material    @relation(fields: [materialId], references: [id], onDelete: Restrict)
+  quantity      Float       @default(1)
+
+  @@index([productCostId])
+  @@index([materialId])
+}
+
+/// Total ad spend for one calendar day. One row per day per shop.
+model AdSpend {
+  id        String   @id @default(cuid())
+  shop      String
+  date      String // YYYY-MM-DD (kept as a string so a "day" is timezone-stable)
+  amount    Float // total spent on ads that day, in EGP
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shop, date])
+  @@index([shop])
+}
+
+/// A delivery zone with the typical REAL courier cost (what the express company
+/// charges you), used as the default before any per-order override.
+/// `keywords` is a comma-separated list matched against the order's city/province.
+model DeliveryZone {
+  id        String   @id @default(cuid())
+  shop      String
+  name      String // e.g. "Cairo", "Giza", "Alexandria", "Delta", "Upper Egypt"
+  keywords  String   @default("") // comma-separated match terms, case-insensitive
+  realCost  Float    @default(0) // typical real courier cost in EGP
+  isDefault Boolean  @default(false) // fallback when no zone matches the address
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shop])
+}
+
+/// Per-order overrides layered on top of the live Shopify order data:
+/// the real delivery cost for THIS order and the delivery outcome
+/// (delivered / rejected / returned). One row per order per shop.
+model OrderCost {
+  id               String   @id @default(cuid())
+  shop             String
+  orderId          String // Shopify order GID
+  name             String   @default("") // cached order name, e.g. "#1001"
+  realDeliveryCost Float? // override; when null, resolved from the matching zone
+  deliveryOutcome  String   @default("delivered") // delivered | rejected | returned
+  roundTrip        Boolean  @default(false) // rejected/returned => paid shipping both ways
+  note             String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([shop, orderId])
+  @@index([shop])
+}
+
+/// Per-shop configuration for the money math.
+model Settings {
+  id                  String   @id @default(cuid())
+  shop                String   @unique
+  currency            String   @default("EGP")
+  paymentFeePercent   Float    @default(0) // card/gateway fee as a % of revenue
+  paymentFeeFlat      Float    @default(0) // flat fee per order
+  codFeePercent       Float    @default(0) // extra COD collection fee as a % (0 = same as card)
+  codRoundTripDefault Boolean  @default(true) // rejected COD counts delivery x2 by default
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+/// Any business cost that isn't per-order: Shopify subscription, electricity,
+/// water, rent, a one-off repair, etc. Recurring ones are prorated across a
+/// report's date range; one-time ones count on their date.
+model Expense {
+  id         String   @id @default(cuid())
+  shop       String
+  label      String // free text — "Shopify plan", "Electricity", "Fridge repair"…
+  category   String   @default("other") // subscription | bill | urgent | other
+  amount     Float
+  frequency  String   @default("monthly") // once | daily | weekly | monthly
+  date       String? // YYYY-MM-DD, used when frequency = once
+  dayOfMonth Int? // reminder of which day it's usually paid (monthly)
+  active     Boolean  @default(true)
+  note       String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([shop])
+}
+
+/// A worker/employee. Monthly salary is prorated into reports; one-off gifts and
+/// bonuses are logged as WorkerPayment rows.
+model Worker {
+  id            String          @id @default(cuid())
+  shop          String
+  name          String
+  age           Int?
+  monthlySalary Float           @default(0)
+  active        Boolean         @default(true)
+  note          String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  payments      WorkerPayment[]
+
+  @@index([shop])
+}
+
+/// A dated, timestamped bonus/gift (or other one-off payment) to a worker.
+model WorkerPayment {
+  id        String   @id @default(cuid())
+  shop      String
+  workerId  String
+  worker    Worker   @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  amount    Float
+  type      String   @default("bonus") // bonus | gift | other
+  date      String // YYYY-MM-DD occurrence date
+  note      String?
+  createdAt DateTime @default(now()) // exact time it was logged
+
+  @@index([shop])
+  @@index([workerId])
+}
