@@ -54,9 +54,12 @@ export type ProductUnitCost = {
   productId: string;
   title: string;
   materialCost: number;
+  returnMaterialUnitCost: number;
   factoryCost: number;
   otherCost: number;
   unitCost: number;
+  returnDeliveryMode: string;
+  returnDeliveryPercent: number;
 };
 
 export type OrderOverride = {
@@ -158,13 +161,21 @@ export async function loadCostMap(shop: string): Promise<CostMap> {
       (sum, line) => sum + line.quantity * line.material.costPerUnit,
       0,
     );
+    const returnMaterialCost = row.bomLines.reduce(
+      (sum, line) =>
+        sum + (line.countOnReturn ? line.quantity * line.material.costPerUnit : 0),
+      0,
+    );
     map.set(row.productId, {
       productId: row.productId,
       title: row.title,
       materialCost: round2(materialCost),
+      returnMaterialUnitCost: round2(returnMaterialCost),
       factoryCost: round2(row.factoryCost),
       otherCost: round2(row.otherCost),
       unitCost: round2(materialCost + row.factoryCost + row.otherCost),
+      returnDeliveryMode: row.returnDeliveryMode,
+      returnDeliveryPercent: row.returnDeliveryPercent,
     });
   }
   return map;
@@ -206,6 +217,76 @@ function detectCOD(gateways: string[]): boolean {
   });
 }
 
+function clampPercent(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+function inferOrderOutcome(order: NormalizedOrder): "delivered" | "rejected" | "returned" {
+  const financial = (order.financialStatus ?? "").toUpperCase();
+  const fulfillment = (order.fulfillmentStatus ?? "").toUpperCase();
+
+  if (fulfillment.includes("RETURN")) return "returned";
+  if (financial === "REFUNDED") return "returned";
+  if (order.cancelledAt || fulfillment.includes("CANCEL") || financial === "VOIDED") {
+    return "rejected";
+  }
+  return "delivered";
+}
+
+function resolveSettingsReturnDelivery(baseDelivery: number, settings: ShopSettings): number {
+  if (settings.returnDeliveryMode === "fixed") {
+    return Math.max(0, settings.returnDeliveryFixed);
+  }
+  if (settings.returnDeliveryMode === "percent") {
+    return baseDelivery * (clampPercent(settings.returnDeliveryPercent) / 100);
+  }
+  return baseDelivery;
+}
+
+function resolveReturnedOrderDelivery(
+  order: NormalizedOrder,
+  baseDelivery: number,
+  settings: ShopSettings,
+  costMap: CostMap,
+): number {
+  if (order.lineItems.length === 0) {
+    return resolveSettingsReturnDelivery(baseDelivery, settings);
+  }
+
+  const totalQty = order.lineItems.reduce((sum, line) => sum + line.quantity, 0);
+  const evenShare = order.lineItems.length > 0 ? 1 / order.lineItems.length : 1;
+
+  let total = 0;
+  for (const line of order.lineItems) {
+    const share = totalQty > 0 ? line.quantity / totalQty : evenShare;
+    const cost = line.productId ? costMap.get(line.productId) : undefined;
+    const mode = cost?.returnDeliveryMode ?? "settings";
+
+    if (mode === "full") {
+      total += baseDelivery * share;
+      continue;
+    }
+
+    if (mode === "percent") {
+      const pct = clampPercent(cost?.returnDeliveryPercent ?? settings.returnDeliveryPercent);
+      total += baseDelivery * share * (pct / 100);
+      continue;
+    }
+
+    if (settings.returnDeliveryMode === "fixed") {
+      total += Math.max(0, settings.returnDeliveryFixed) * share;
+    } else if (settings.returnDeliveryMode === "percent") {
+      const pct = clampPercent(settings.returnDeliveryPercent);
+      total += baseDelivery * share * (pct / 100);
+    } else {
+      total += baseDelivery * share;
+    }
+  }
+
+  return total;
+}
+
 export function computeOrderPnl(
   order: NormalizedOrder,
   ctx: {
@@ -216,29 +297,30 @@ export function computeOrderPnl(
   },
 ): OrderPnl {
   const { costMap, zones, settings, override } = ctx;
-  const outcome = override?.deliveryOutcome ?? "delivered";
+  const outcome = override?.deliveryOutcome ?? inferOrderOutcome(order);
   const delivered = outcome === "delivered";
 
-  // --- Materials: only a real cost when the goods actually left (delivered). ---
+  // --- Materials: delivered uses full unit cost; returned/rejected can include only selected materials. ---
   let materialsCost = 0;
   let missingCost = false;
-  if (delivered) {
-    for (const line of order.lineItems) {
-      const cost = line.productId ? costMap.get(line.productId) : undefined;
-      if (!cost) {
-        missingCost = true;
-        continue;
-      }
-      materialsCost += cost.unitCost * line.quantity;
+  for (const line of order.lineItems) {
+    const cost = line.productId ? costMap.get(line.productId) : undefined;
+    if (!cost) {
+      missingCost = true;
+      continue;
     }
+    materialsCost += (delivered ? cost.unitCost : cost.returnMaterialUnitCost) * line.quantity;
   }
 
   // --- Real delivery cost: per-order override first, else the matching zone. ---
   const zone = matchZone(order, zones);
-  let realDelivery = override?.realDeliveryCost ?? zone?.realCost ?? 0;
+  const baseDelivery = override?.realDeliveryCost ?? zone?.realCost ?? 0;
   // Rejected / returned orders often mean you paid the courier both ways.
   const roundTrip = override?.roundTrip ?? (!delivered && settings.codRoundTripDefault);
-  if (!delivered && roundTrip) realDelivery *= 2;
+  const roundTripDelivery = !delivered && roundTrip ? baseDelivery * 2 : baseDelivery;
+  const realDelivery = delivered
+    ? roundTripDelivery
+    : resolveReturnedOrderDelivery(order, roundTripDelivery, settings, costMap);
 
   // --- Revenue you keep: total minus tax (a pass-through). Zero if not delivered. ---
   const revenue = delivered ? Math.max(0, order.total - order.tax) : 0;
@@ -294,8 +376,8 @@ const ORDERS_QUERY = `#graphql
           name
           createdAt
           cancelledAt
-          displayFinancialStatus
-          displayFulfillmentStatus
+          financialStatus
+          fulfillmentStatus
           paymentGatewayNames
           currentTotalPriceSet { shopMoney { amount } }
           currentTotalTaxSet { shopMoney { amount } }
@@ -326,7 +408,7 @@ function money(bag: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-const MAX_PAGES = 20; // safety cap: up to 20 * 100 = 2000 orders per report
+const MAX_PAGES = 100; // safety cap: up to 100 * 100 = 10,000 orders per report
 
 /** Fetch and normalize all orders created within [startDay, endDay] (inclusive). */
 export async function fetchOrders(
@@ -361,8 +443,8 @@ export async function fetchOrders(
         name: node.name ?? "",
         createdAt: node.createdAt,
         cancelledAt: node.cancelledAt ?? null,
-        financialStatus: node.displayFinancialStatus ?? null,
-        fulfillmentStatus: node.displayFulfillmentStatus ?? null,
+        financialStatus: node.financialStatus ?? null,
+        fulfillmentStatus: node.fulfillmentStatus ?? null,
         gateways,
         isCOD: detectCOD(gateways),
         total: money(node.currentTotalPriceSet),
@@ -451,7 +533,7 @@ export async function buildReport(
   for (const order of fetched.orders) {
     const orderPnl = orderPnlMap.get(order.id);
     if (!orderPnl) continue;
-    const delivered = (overrideMap.get(order.id)?.deliveryOutcome ?? "delivered") === "delivered";
+    const delivered = (overrideMap.get(order.id)?.deliveryOutcome ?? inferOrderOutcome(order)) === "delivered";
     if (!delivered) continue;
 
     const totalLineRevenue = order.lineItems.reduce((sum, line) => sum + line.revenue, 0);
@@ -637,7 +719,7 @@ export async function computeMaterialUsage(
   const outcome = new Map(overrideRows.map((o) => [o.orderId, o.deliveryOutcome]));
   const usage = new Map<string, number>();
   for (const order of fetched.orders) {
-    if ((outcome.get(order.id) ?? "delivered") !== "delivered") continue;
+    if ((outcome.get(order.id) ?? inferOrderOutcome(order)) !== "delivered") continue;
     for (const line of order.lineItems) {
       const recipe = line.productId ? recipeMap.get(line.productId) : undefined;
       if (!recipe) continue;

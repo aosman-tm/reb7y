@@ -23,9 +23,12 @@ const costMap: CostMap = new Map([
     productId: "gid://shopify/Product/P1",
     title: "Product 1",
     materialCost: 18,
+    returnMaterialUnitCost: 0,
     factoryCost: 0,
     otherCost: 0,
     unitCost: 18,
+    returnDeliveryMode: "settings",
+    returnDeliveryPercent: 100,
   }],
 ]);
 
@@ -42,6 +45,9 @@ const settings: ShopSettings = {
   paymentFeeFlat: 0,
   codFeePercent: 0,
   codRoundTripDefault: true,
+  returnDeliveryMode: "full",
+  returnDeliveryPercent: 100,
+  returnDeliveryFixed: 0,
 };
 
 function order(overrides: Partial<NormalizedOrder>): NormalizedOrder {

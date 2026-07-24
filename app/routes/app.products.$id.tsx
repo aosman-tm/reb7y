@@ -10,6 +10,7 @@ import {
   Text,
   TextField,
   Select,
+  Checkbox,
   Button,
   IndexTable,
   Thumbnail,
@@ -61,6 +62,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     unit: l.material.unit,
     costPerUnit: l.material.costPerUnit,
     quantity: l.quantity,
+    countOnReturn: l.countOnReturn,
     lineCost: round2(l.quantity * l.material.costPerUnit),
   }));
   const materialTotal = round2(lines.reduce((s, l) => s + l.lineCost, 0));
@@ -87,6 +89,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     unitCost,
     margin: round2(price - unitCost),
     currency: settings.currency,
+    returnDeliveryMode: productCost?.returnDeliveryMode ?? "settings",
+    returnDeliveryPercent: round2(productCost?.returnDeliveryPercent ?? 100),
+    settingsReturnDeliveryMode: settings.returnDeliveryMode,
+    settingsReturnDeliveryPercent: settings.returnDeliveryPercent,
+    settingsReturnDeliveryFixed: settings.returnDeliveryFixed,
     hasRecipe: Boolean(productCost),
   };
 };
@@ -120,6 +127,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   if (intent === "saveExtras") {
+    const returnDeliveryMode = String(form.get("returnDeliveryMode") ?? "settings");
+    const returnDeliveryPercent = parseAmount(form.get("returnDeliveryPercent"), 100);
     await prisma.productCost.upsert({
       where: { shop_productId: { shop, productId: gid } },
       create: {
@@ -128,10 +137,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         title: String(form.get("title") ?? ""),
         factoryCost: parseAmount(form.get("factoryCost")),
         otherCost: parseAmount(form.get("otherCost")),
+        returnDeliveryMode,
+        returnDeliveryPercent,
       },
       update: {
         factoryCost: parseAmount(form.get("factoryCost")),
         otherCost: parseAmount(form.get("otherCost")),
+        returnDeliveryMode,
+        returnDeliveryPercent,
       },
     });
     return { ok: true };
@@ -156,6 +169,20 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return { ok: true };
   }
 
+  if (intent === "toggleReturnLine") {
+    const lineId = String(form.get("lineId") ?? "");
+    const line = await prisma.bomLine.findUnique({
+      where: { id: lineId },
+      include: { productCost: true },
+    });
+    if (!line || line.productCost.shop !== shop) return { error: "Not found." };
+    await prisma.bomLine.update({
+      where: { id: lineId },
+      data: { countOnReturn: form.get("countOnReturn") === "true" },
+    });
+    return { ok: true };
+  }
+
   return { error: "Unknown action." };
 };
 
@@ -165,6 +192,7 @@ type Line = {
   unit: string;
   costPerUnit: number;
   quantity: number;
+  countOnReturn: boolean;
   lineCost: number;
 };
 
@@ -216,6 +244,19 @@ function LineRow({
       </IndexTable.Cell>
       <IndexTable.Cell>{formatMoney(liveCost, currency)}</IndexTable.Cell>
       <IndexTable.Cell>
+        <Checkbox
+          label="Count on return"
+          labelHidden
+          checked={line.countOnReturn}
+          onChange={(checked) =>
+            fetcher.submit(
+              { _action: "toggleReturnLine", lineId: line.id, countOnReturn: String(checked) },
+              { method: "post" },
+            )
+          }
+        />
+      </IndexTable.Cell>
+      <IndexTable.Cell>
         <InlineStack gap="200" align="end" blockAlign="center">
           <Button
             size="slim"
@@ -256,6 +297,10 @@ export default function ProductCostEditor() {
   const [qty, setQty] = useState("1");
   const [factory, setFactory] = useState(String(data.factoryCost));
   const [other, setOther] = useState(String(data.otherCost));
+  const [returnDeliveryMode, setReturnDeliveryMode] = useState(data.returnDeliveryMode);
+  const [returnDeliveryPercent, setReturnDeliveryPercent] = useState(
+    String(data.returnDeliveryPercent),
+  );
 
   const { product, lines, materials, currency } = data;
   const materialOptions = [
@@ -264,6 +309,17 @@ export default function ProductCostEditor() {
       label: `${m.name} — ${formatMoney(m.costPerUnit, currency)} / ${m.unit}`,
       value: m.id,
     })),
+  ];
+  const settingsDeliveryLabel =
+    data.settingsReturnDeliveryMode === "fixed"
+      ? `${formatMoney(data.settingsReturnDeliveryFixed, currency)} fixed`
+      : data.settingsReturnDeliveryMode === "percent"
+        ? `${data.settingsReturnDeliveryPercent}% of real delivery`
+        : "full real delivery";
+  const returnDeliveryOptions = [
+    { label: `Use settings default (${settingsDeliveryLabel})`, value: "settings" },
+    { label: "Charge full real delivery", value: "full" },
+    { label: "Charge percentage of real delivery", value: "percent" },
   ];
 
   return (
@@ -336,6 +392,7 @@ export default function ProductCostEditor() {
                 { title: "Unit cost" },
                 { title: "Quantity" },
                 { title: "Line cost" },
+                { title: "Count on return" },
                 { title: "" },
               ]}
             >
@@ -394,11 +451,31 @@ export default function ProductCostEditor() {
         <Card>
           <BlockStack gap="400">
             <Text as="h3" variant="headingMd">
-              Factory &amp; other costs
+              Factory, return &amp; other costs
             </Text>
             <Text as="p" tone="subdued" variant="bodySm">
-              Factory cost is added to every sold item before profit is calculated.
+              For returned orders, only materials marked "Count on return" above are charged.
             </Text>
+            <Select
+              label="Returned order delivery (this product)"
+              options={returnDeliveryOptions}
+              value={returnDeliveryMode}
+              onChange={setReturnDeliveryMode}
+              helpText="Use settings default, or override this product to charge full delivery or only a percentage."
+            />
+            {returnDeliveryMode === "percent" && (
+              <TextField
+                label="Returned delivery percentage for this product"
+                type="number"
+                value={returnDeliveryPercent}
+                onChange={setReturnDeliveryPercent}
+                autoComplete="off"
+                suffix="%"
+                min={0}
+                max={100}
+                step={1}
+              />
+            )}
             <InlineGrid columns={{ xs: 1, sm: "1fr 1fr auto" }} gap="300">
               <TextField
                 label="Factory cost per item"
@@ -431,6 +508,8 @@ export default function ProductCostEditor() {
                         _action: "saveExtras",
                         factoryCost: factory || "0",
                         otherCost: other || "0",
+                        returnDeliveryMode,
+                        returnDeliveryPercent: returnDeliveryPercent || "100",
                         title: product.title,
                       },
                       { method: "post" },

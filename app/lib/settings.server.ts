@@ -8,6 +8,9 @@ export type ShopSettings = {
   paymentFeeFlat: number;
   codFeePercent: number;
   codRoundTripDefault: boolean;
+  returnDeliveryMode: string;
+  returnDeliveryPercent: number;
+  returnDeliveryFixed: number;
 };
 
 /** Get the shop's settings row, creating a default one on first use. */

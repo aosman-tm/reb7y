@@ -25,6 +25,12 @@ const CURRENCIES = ["EGP", "USD", "GBP", "EUR", "SAR", "AED"].map((c) => ({
   value: c,
 }));
 
+const RETURN_DELIVERY_OPTIONS = [
+  { label: "Charge full real delivery", value: "full" },
+  { label: "Charge percentage of real delivery", value: "percent" },
+  { label: "Charge fixed amount", value: "fixed" },
+];
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const settings = await getSettings(session.shop);
@@ -41,6 +47,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     paymentFeeFlat: parseAmount(form.get("paymentFeeFlat")),
     codFeePercent: parseAmount(form.get("codFeePercent")),
     codRoundTripDefault: form.get("codRoundTripDefault") === "true",
+    returnDeliveryMode: String(form.get("returnDeliveryMode") ?? "full"),
+    returnDeliveryPercent: parseAmount(form.get("returnDeliveryPercent"), 100),
+    returnDeliveryFixed: parseAmount(form.get("returnDeliveryFixed"), 0),
   };
   await prisma.settings.upsert({
     where: { shop },
@@ -59,6 +68,13 @@ export default function SettingsPage() {
   const [feeFlat, setFeeFlat] = useState(String(settings.paymentFeeFlat));
   const [codPct, setCodPct] = useState(String(settings.codFeePercent));
   const [codRoundTrip, setCodRoundTrip] = useState(settings.codRoundTripDefault);
+  const [returnDeliveryMode, setReturnDeliveryMode] = useState(settings.returnDeliveryMode);
+  const [returnDeliveryPercent, setReturnDeliveryPercent] = useState(
+    String(settings.returnDeliveryPercent),
+  );
+  const [returnDeliveryFixed, setReturnDeliveryFixed] = useState(
+    String(settings.returnDeliveryFixed),
+  );
   const busy = fetcher.state !== "idle";
   const saved = fetcher.data && "ok" in fetcher.data && fetcher.state === "idle";
 
@@ -133,13 +149,45 @@ export default function SettingsPage() {
             <Text as="h2" variant="headingMd">
               Rejected / returned orders
             </Text>
+            <Select
+              label="Default return delivery cost"
+              options={RETURN_DELIVERY_OPTIONS}
+              value={returnDeliveryMode}
+              onChange={setReturnDeliveryMode}
+            />
+            {returnDeliveryMode === "percent" && (
+              <TextField
+                label="Default return delivery percentage"
+                type="number"
+                value={returnDeliveryPercent}
+                onChange={setReturnDeliveryPercent}
+                autoComplete="off"
+                suffix="%"
+                min={0}
+                max={100}
+                step={1}
+              />
+            )}
+            {returnDeliveryMode === "fixed" && (
+              <TextField
+                label="Default fixed return delivery amount"
+                type="number"
+                value={returnDeliveryFixed}
+                onChange={setReturnDeliveryFixed}
+                autoComplete="off"
+                prefix={currency}
+                min={0}
+                step={0.01}
+              />
+            )}
             <Checkbox
               label="Count delivery cost twice on rejected/returned orders (paid the courier both ways)"
               checked={codRoundTrip}
               onChange={setCodRoundTrip}
             />
             <Text as="p" tone="subdued" variant="bodySm">
-              This is the default. You can still change round-trip on any individual order.
+              These are defaults. You can still adjust each order manually, and each product can
+              override how much delivery is charged when returned.
             </Text>
           </BlockStack>
         </Card>
@@ -156,6 +204,9 @@ export default function SettingsPage() {
                   paymentFeeFlat: feeFlat || "0",
                   codFeePercent: codPct || "0",
                   codRoundTripDefault: String(codRoundTrip),
+                  returnDeliveryMode,
+                  returnDeliveryPercent: returnDeliveryPercent || "100",
+                  returnDeliveryFixed: returnDeliveryFixed || "0",
                 },
                 { method: "post" },
               )

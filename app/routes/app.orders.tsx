@@ -30,7 +30,7 @@ import { RangeSelector } from "../components/RangeSelector";
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
-  const range = resolveRange(url.searchParams.get("range") ?? "30d");
+  const range = resolveRange(url.searchParams.get("range") ?? "all");
   const report = await buildReport(admin, session.shop, range.start, range.end);
   return { report, rangePreset: range.preset };
 };
@@ -141,6 +141,10 @@ export default function OrdersPage() {
           <p>
             Order profit calculations include all Shopify orders inside the selected date range,
             including orders placed before this app was installed.
+          </p>
+          <p>
+            If you still only see recent orders, Shopify's <b>read_orders</b> scope only returns
+            the last 60 days. Request <b>read_all_orders</b> for full historical access.
           </p>
         </Banner>
 
@@ -265,7 +269,7 @@ export default function OrdersPage() {
 
         {report.truncated && (
           <Text as="p" tone="subdued" alignment="center">
-            Showing the most recent 2,000 orders in this range.
+            Showing the most recent 10,000 orders in this range.
           </Text>
         )}
       </BlockStack>

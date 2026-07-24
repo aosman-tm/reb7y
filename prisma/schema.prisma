@@ -71,15 +71,17 @@ model CustomUnit {
 /// its BomLines; `otherCost` covers anything not tracked as a material
 /// (labour, tape, handling...). One row per Shopify product per shop.
 model ProductCost {
-  id        String    @id @default(cuid())
-  shop      String
-  productId String // Shopify product GID, e.g. gid://shopify/Product/123
-  title     String    @default("")
-  factoryCost Float   @default(0) // manufacturing/factory cost per item in shop currency
-  otherCost Float     @default(0) // extra per-item cost (labour / misc) in EGP
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  bomLines  BomLine[]
+  id                    String    @id @default(cuid())
+  shop                  String
+  productId             String // Shopify product GID, e.g. gid://shopify/Product/123
+  title                 String    @default("")
+  factoryCost           Float     @default(0) // manufacturing/factory cost per item in shop currency
+  otherCost             Float     @default(0) // extra per-item cost (labour / misc) in EGP
+  returnDeliveryMode    String    @default("settings") // settings | full | percent
+  returnDeliveryPercent Float     @default(100) // used when mode = percent
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  bomLines              BomLine[]
 
   @@unique([shop, productId])
   @@index([shop])
@@ -93,6 +95,7 @@ model BomLine {
   materialId    String
   material      Material    @relation(fields: [materialId], references: [id], onDelete: Restrict)
   quantity      Float       @default(1)
+  countOnReturn Boolean     @default(false)
 
   @@index([productCostId])
   @@index([materialId])
@@ -149,15 +152,18 @@ model OrderCost {
 
 /// Per-shop configuration for the money math.
 model Settings {
-  id                  String   @id @default(cuid())
-  shop                String   @unique
-  currency            String   @default("EGP")
-  paymentFeePercent   Float    @default(0) // card/gateway fee as a % of revenue
-  paymentFeeFlat      Float    @default(0) // flat fee per order
-  codFeePercent       Float    @default(0) // extra COD collection fee as a % (0 = same as card)
-  codRoundTripDefault Boolean  @default(true) // rejected COD counts delivery x2 by default
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  id                    String   @id @default(cuid())
+  shop                  String   @unique
+  currency              String   @default("EGP")
+  paymentFeePercent     Float    @default(0) // card/gateway fee as a % of revenue
+  paymentFeeFlat        Float    @default(0) // flat fee per order
+  codFeePercent         Float    @default(0) // extra COD collection fee as a % (0 = same as card)
+  codRoundTripDefault   Boolean  @default(true) // rejected COD counts delivery x2 by default
+  returnDeliveryMode    String   @default("full") // full | percent | fixed
+  returnDeliveryPercent Float    @default(100) // used when mode = percent
+  returnDeliveryFixed   Float    @default(0) // used when mode = fixed
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 }
 
 /// Any business cost that isn't per-order: Shopify subscription, electricity,
