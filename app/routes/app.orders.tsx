@@ -234,8 +234,24 @@ export default function OrdersPage() {
                     <BlockStack gap="050">
                       <Text as="span">{formatMoney(o.realDelivery, currency)}</Text>
                       {o.delivered ? (
-                        <Text as="span" variant="bodySm" tone="success">
+                        <Text
+                          as="span"
+                          variant="bodySm"
+                          tone={
+                            o.deliveryGap < 0
+                              ? "critical"
+                              : o.deliveryGap > 0
+                                ? "success"
+                                : "subdued"
+                          }
+                        >
                           charged {formatMoney(o.shippingCharged, currency)}
+                          {" · "}
+                          {o.deliveryGap < 0
+                            ? `lose ${formatMoney(-o.deliveryGap, currency)}`
+                            : o.deliveryGap > 0
+                              ? `profit ${formatMoney(o.deliveryGap, currency)}`
+                              : "break-even"}
                         </Text>
                       ) : (
                         <Text as="span" variant="bodySm" tone="critical">
