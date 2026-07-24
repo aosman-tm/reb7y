@@ -376,8 +376,8 @@ const ORDERS_QUERY = `#graphql
           name
           createdAt
           cancelledAt
-          financialStatus
-          fulfillmentStatus
+          displayFinancialStatus
+          displayFulfillmentStatus
           paymentGatewayNames
           currentTotalPriceSet { shopMoney { amount } }
           currentTotalTaxSet { shopMoney { amount } }
@@ -443,8 +443,8 @@ export async function fetchOrders(
         name: node.name ?? "",
         createdAt: node.createdAt,
         cancelledAt: node.cancelledAt ?? null,
-        financialStatus: node.financialStatus ?? null,
-        fulfillmentStatus: node.fulfillmentStatus ?? null,
+        financialStatus: node.displayFinancialStatus ?? null,
+        fulfillmentStatus: node.displayFulfillmentStatus ?? null,
         gateways,
         isCOD: detectCOD(gateways),
         total: money(node.currentTotalPriceSet),
