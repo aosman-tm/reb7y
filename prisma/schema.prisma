@@ -158,7 +158,7 @@ model Settings {
   paymentFeePercent     Float    @default(0) // card/gateway fee as a % of revenue
   paymentFeeFlat        Float    @default(0) // flat fee per order
   codFeePercent         Float    @default(0) // extra COD collection fee as a % (0 = same as card)
-  codRoundTripDefault   Boolean  @default(true) // rejected COD counts delivery x2 by default
+  codRoundTripDefault   Boolean  @default(false) // rejected COD counts delivery x2 by default
   returnDeliveryMode    String   @default("full") // full | percent | fixed
   returnDeliveryPercent Float    @default(100) // used when mode = percent
   returnDeliveryFixed   Float    @default(0) // used when mode = fixed

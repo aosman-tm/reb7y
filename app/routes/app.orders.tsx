@@ -236,12 +236,14 @@ export default function OrdersPage() {
                       <Text
                         as="span"
                         variant="bodySm"
-                        tone={o.deliveryGap < 0 ? "critical" : "subdued"}
+                        tone={!o.delivered || o.deliveryGap < 0 ? "critical" : "subdued"}
                       >
-                        charged {formatMoney(o.shippingCharged, currency)}
-                        {o.deliveryGap < 0
-                          ? ` · lose ${formatMoney(-o.deliveryGap, currency)}`
-                          : ""}
+                        {o.delivered
+                          ? o.deliveryGap < 0
+                            ? `lose ${formatMoney(-o.deliveryGap, currency)}`
+                            : "no delivery loss"
+                          : `lose ${formatMoney(o.realDelivery, currency)}`}
+                        {!o.delivered && o.returnDeliveryRule ? ` · ${o.returnDeliveryRule}` : ""}
                       </Text>
                     </BlockStack>
                   </IndexTable.Cell>

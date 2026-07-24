@@ -89,6 +89,7 @@ export type OrderPnl = {
   zoneName: string | null;
   zoneCost: number; // the matched zone's real cost (before any override)
   overrideDelivery: number | null; // per-order override value, if the merchant set one
+  returnDeliveryRule: string | null; // full | fixed | percent | mixed by products
   roundTrip: boolean; // effective round-trip flag used in this calc
   note: string | null;
   hasOverride: boolean;
@@ -193,16 +194,41 @@ export type Zone = {
   isDefault: boolean;
 };
 
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /** Find the delivery zone that matches an order's shipping address. */
 export function matchZone(order: NormalizedOrder, zones: Zone[]): Zone | null {
-  const haystack = `${order.city ?? ""} ${order.province ?? ""} ${order.country ?? ""}`.toLowerCase();
+  const rawParts = [order.city ?? "", order.province ?? "", order.country ?? ""].filter(Boolean);
+  const parts = rawParts.map(normalizeText).filter(Boolean);
+  const haystack = normalizeText(rawParts.join(" "));
+
+  // First: match by zone name itself so merchants can keep a short zone list.
+  for (const zone of zones) {
+    const zoneName = normalizeText(zone.name);
+    if (!zoneName) continue;
+    if (parts.some((part) => part === zoneName || part.includes(zoneName) || zoneName.includes(part))) {
+      return zone;
+    }
+  }
+
+  // Second: fallback to keyword matching for special cases.
   for (const zone of zones) {
     const keywords = zone.keywords
       .split(",")
-      .map((k) => k.trim().toLowerCase())
+      .map((k) => normalizeText(k))
       .filter(Boolean);
     if (keywords.some((k) => haystack.includes(k))) return zone;
   }
+
+  // Final fallback: default zone.
   return zones.find((z) => z.isDefault) ?? null;
 }
 
@@ -222,6 +248,12 @@ function clampPercent(n: number): number {
   return Math.max(0, Math.min(100, n));
 }
 
+function formatRuleLabel(mode: string, percentOrFixed?: number): string {
+  if (mode === "fixed") return `fixed (${round2(percentOrFixed ?? 0)})`;
+  if (mode === "percent") return `percent (${clampPercent(percentOrFixed ?? 0)}%)`;
+  return "full";
+}
+
 function inferOrderOutcome(order: NormalizedOrder): "delivered" | "rejected" | "returned" {
   const financial = (order.financialStatus ?? "").toUpperCase();
   const fulfillment = (order.fulfillmentStatus ?? "").toUpperCase();
@@ -234,14 +266,23 @@ function inferOrderOutcome(order: NormalizedOrder): "delivered" | "rejected" | "
   return "delivered";
 }
 
-function resolveSettingsReturnDelivery(baseDelivery: number, settings: ShopSettings): number {
+function resolveSettingsReturnDelivery(
+  baseDelivery: number,
+  settings: ShopSettings,
+): { amount: number; label: string } {
   if (settings.returnDeliveryMode === "fixed") {
-    return Math.max(0, settings.returnDeliveryFixed);
+    return {
+      amount: Math.max(0, settings.returnDeliveryFixed),
+      label: formatRuleLabel("fixed", settings.returnDeliveryFixed),
+    };
   }
   if (settings.returnDeliveryMode === "percent") {
-    return baseDelivery * (clampPercent(settings.returnDeliveryPercent) / 100);
+    return {
+      amount: baseDelivery * (clampPercent(settings.returnDeliveryPercent) / 100),
+      label: formatRuleLabel("percent", settings.returnDeliveryPercent),
+    };
   }
-  return baseDelivery;
+  return { amount: baseDelivery, label: formatRuleLabel("full") };
 }
 
 function resolveReturnedOrderDelivery(
@@ -249,7 +290,7 @@ function resolveReturnedOrderDelivery(
   baseDelivery: number,
   settings: ShopSettings,
   costMap: CostMap,
-): number {
+): { amount: number; label: string } {
   if (order.lineItems.length === 0) {
     return resolveSettingsReturnDelivery(baseDelivery, settings);
   }
@@ -258,6 +299,7 @@ function resolveReturnedOrderDelivery(
   const evenShare = order.lineItems.length > 0 ? 1 / order.lineItems.length : 1;
 
   let total = 0;
+  const labels = new Set<string>();
   for (const line of order.lineItems) {
     const share = totalQty > 0 ? line.quantity / totalQty : evenShare;
     const cost = line.productId ? costMap.get(line.productId) : undefined;
@@ -265,26 +307,26 @@ function resolveReturnedOrderDelivery(
 
     if (mode === "full") {
       total += baseDelivery * share;
+      labels.add(formatRuleLabel("full"));
       continue;
     }
 
     if (mode === "percent") {
       const pct = clampPercent(cost?.returnDeliveryPercent ?? settings.returnDeliveryPercent);
       total += baseDelivery * share * (pct / 100);
+      labels.add(formatRuleLabel("percent", pct));
       continue;
     }
 
-    if (settings.returnDeliveryMode === "fixed") {
-      total += Math.max(0, settings.returnDeliveryFixed) * share;
-    } else if (settings.returnDeliveryMode === "percent") {
-      const pct = clampPercent(settings.returnDeliveryPercent);
-      total += baseDelivery * share * (pct / 100);
-    } else {
-      total += baseDelivery * share;
-    }
+    const settingsResolved = resolveSettingsReturnDelivery(baseDelivery, settings);
+    total += settingsResolved.amount * share;
+    labels.add(`settings: ${settingsResolved.label}`);
   }
 
-  return total;
+  return {
+    amount: total,
+    label: labels.size === 1 ? Array.from(labels)[0] : "mixed by products",
+  };
 }
 
 export function computeOrderPnl(
@@ -318,9 +360,10 @@ export function computeOrderPnl(
   // Rejected / returned orders often mean you paid the courier both ways.
   const roundTrip = override?.roundTrip ?? (!delivered && settings.codRoundTripDefault);
   const roundTripDelivery = !delivered && roundTrip ? baseDelivery * 2 : baseDelivery;
-  const realDelivery = delivered
-    ? roundTripDelivery
+  const resolvedReturnDelivery = delivered
+    ? null
     : resolveReturnedOrderDelivery(order, roundTripDelivery, settings, costMap);
+  const realDelivery = delivered ? roundTripDelivery : resolvedReturnDelivery?.amount ?? 0;
 
   // --- Revenue you keep: total minus tax (a pass-through). Zero if not delivered. ---
   const revenue = delivered ? Math.max(0, order.total - order.tax) : 0;
@@ -354,6 +397,7 @@ export function computeOrderPnl(
     zoneName: zone?.name ?? null,
     zoneCost: round2(zone?.realCost ?? 0),
     overrideDelivery: override?.realDeliveryCost ?? null,
+    returnDeliveryRule: delivered ? null : resolvedReturnDelivery?.label ?? null,
     roundTrip,
     note: override?.note ?? null,
     hasOverride: Boolean(override),
