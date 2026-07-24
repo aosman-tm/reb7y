@@ -6,7 +6,6 @@ import {
   Card,
   BlockStack,
   InlineStack,
-  InlineGrid,
   Text,
   TextField,
   Select,
