@@ -23,51 +23,6 @@ import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
 import { parseAmount, formatMoney } from "../lib/money";
 
-type GraphqlClient = {
-  graphql: (
-    query: string,
-    options?: { variables?: Record<string, unknown> },
-  ) => Promise<Response>;
-};
-
-const ADDRESS_ZONES_QUERY = `#graphql
-  query Reb7yDeliveryAddressZones($first: Int!) {
-    orders(first: $first, sortKey: CREATED_AT, reverse: true) {
-      edges {
-        node {
-          shippingAddress {
-            city
-            province
-          }
-        }
-      }
-    }
-  }`;
-
-function normalizeZoneLabel(value: string): string {
-  return value.trim().replace(/\s+/g, " ");
-}
-
-async function loadShopifyAddressZones(admin: GraphqlClient): Promise<string[]> {
-  try {
-    const response = await admin.graphql(ADDRESS_ZONES_QUERY, { variables: { first: 250 } });
-    const body: any = await response.json();
-    const edges: any[] = body?.data?.orders?.edges ?? [];
-    const labels = new Set<string>();
-
-    for (const edge of edges) {
-      const city = normalizeZoneLabel(String(edge?.node?.shippingAddress?.city ?? ""));
-      const province = normalizeZoneLabel(String(edge?.node?.shippingAddress?.province ?? ""));
-      if (province) labels.add(province);
-      if (city) labels.add(city);
-    }
-
-    return Array.from(labels).sort((a, b) => a.localeCompare(b));
-  } catch {
-    return [];
-  }
-}
-
 // Starter zones for Egypt — keywords match Shopify's shipping city/province text.
 const EGYPT_STARTER = [
   { name: "Cairo", keywords: "cairo,القاهرة", realCost: 0, isDefault: false },
@@ -95,16 +50,15 @@ const EGYPT_STARTER = [
 ];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
-  const [zones, settings, suggestedZones] = await Promise.all([
+  const { session } = await authenticate.admin(request);
+  const [zones, settings] = await Promise.all([
     prisma.deliveryZone.findMany({
       where: { shop: session.shop },
       orderBy: [{ isDefault: "desc" }, { name: "asc" }],
     }),
     getSettings(session.shop),
-    loadShopifyAddressZones(admin),
   ]);
-  return { zones, currency: settings.currency, suggestedZones };
+  return { zones, currency: settings.currency };
 };
 
 async function clearOtherDefaults(shop: string, keepId?: string) {
@@ -159,16 +113,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { error: "Unknown action." };
 };
 
-function AddZone({ suggestedZones, currency }: { suggestedZones: string[]; currency: string }) {
+function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
   const fetcher = useFetcher<typeof action>();
-  const [suggestedName, setSuggestedName] = useState("");
+  const [templateId, setTemplateId] = useState("");
   const [name, setName] = useState("");
   const [keywords, setKeywords] = useState("");
   const [cost, setCost] = useState("");
   const busy = fetcher.state !== "idle";
   const zoneOptions = [
-    { label: "Choose from Shopify addresses…", value: "" },
-    ...suggestedZones.map((z) => ({ label: z, value: z })),
+    { label: "Choose from your zones…", value: "" },
+    ...zones.map((z) => ({ label: z.name, value: z.id })),
   ];
 
   return (
@@ -179,16 +133,19 @@ function AddZone({ suggestedZones, currency }: { suggestedZones: string[]; curre
         </Text>
         <InlineGrid columns={{ xs: 1, sm: "1.5fr 1.5fr 2fr 1fr auto" }} gap="300">
           <Select
-            label="Shopify zone"
+            label="Zone template"
             options={zoneOptions}
-            value={suggestedName}
+            value={templateId}
             onChange={(value) => {
-              setSuggestedName(value);
+              setTemplateId(value);
               if (!value) return;
-              setName(value);
-              if (!keywords.trim()) setKeywords(value.toLowerCase());
+              const selected = zones.find((z) => z.id === value);
+              if (!selected) return;
+              setName(selected.name);
+              setKeywords(selected.keywords);
+              setCost(String(selected.realCost));
             }}
-            helpText="Pick a city/governorate already used in Shopify orders."
+            helpText="Pick from your existing zones, then edit name/keywords/cost before saving."
           />
           <TextField
             label="Zone name"
@@ -225,7 +182,7 @@ function AddZone({ suggestedZones, currency }: { suggestedZones: string[]; curre
                   { _action: "create", name, keywords, realCost: cost || "0", isDefault: "false" },
                   { method: "post" },
                 );
-                setSuggestedName("");
+                setTemplateId("");
                 setName("");
                 setKeywords("");
                 setCost("");
@@ -338,7 +295,7 @@ function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currenc
 }
 
 export default function DeliveryPage() {
-  const { zones, currency, suggestedZones } = useLoaderData<typeof loader>();
+  const { zones, currency } = useLoaderData<typeof loader>();
   const seedFetcher = useFetcher<typeof action>();
 
   return (
@@ -368,7 +325,7 @@ export default function DeliveryPage() {
           </Card>
         )}
 
-        <AddZone suggestedZones={suggestedZones} currency={currency} />
+        <AddZone zones={zones} currency={currency} />
 
         <Card padding="0">
           {zones.length === 0 ? (
