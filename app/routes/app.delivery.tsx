@@ -21,7 +21,7 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
-import { parseAmount, formatMoney } from "../lib/money";
+import { parseAmount } from "../lib/money";
 
 // Starter zones for Egypt — keywords match Shopify's shipping city/province text.
 const EGYPT_STARTER = [
@@ -48,6 +48,73 @@ const EGYPT_STARTER = [
   },
   { name: "Other (rest of Egypt)", keywords: "", realCost: 0, isDefault: true },
 ];
+
+type Zone = {
+  id: string;
+  name: string;
+  keywords: string;
+  realCost: number;
+  isDefault: boolean;
+};
+
+type ZonePreset = {
+  key: string;
+  name: string;
+  keywords: string;
+  isDefault: boolean;
+  existingId: string | null;
+  existingCost: number | null;
+};
+
+function normalizeZoneKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function buildZonePresets(zones: Zone[]): ZonePreset[] {
+  const map = new Map<string, ZonePreset>();
+
+  for (const starter of EGYPT_STARTER) {
+    const key = normalizeZoneKey(starter.name);
+    map.set(key, {
+      key,
+      name: starter.name,
+      keywords: starter.keywords,
+      isDefault: starter.isDefault,
+      existingId: null,
+      existingCost: null,
+    });
+  }
+
+  for (const zone of zones) {
+    const key = normalizeZoneKey(zone.name);
+    const existing = map.get(key);
+    if (existing) {
+      map.set(key, {
+        ...existing,
+        name: zone.name,
+        keywords: zone.keywords || existing.keywords,
+        isDefault: zone.isDefault || existing.isDefault,
+        existingId: zone.id,
+        existingCost: zone.realCost,
+      });
+      continue;
+    }
+
+    map.set(key, {
+      key,
+      name: zone.name,
+      keywords: zone.keywords,
+      isDefault: zone.isDefault,
+      existingId: zone.id,
+      existingCost: zone.realCost,
+    });
+  }
+
+  return Array.from(map.values()).sort((a, b) => {
+    if (a.isDefault === b.isDefault) return a.name.localeCompare(b.name);
+    return a.isDefault ? -1 : 1;
+  });
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -105,6 +172,28 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { ok: true };
   }
 
+  if (intent === "savePrice") {
+    const name = String(form.get("name") ?? "").trim();
+    if (!name) return { error: "Zone is required." };
+    const isDefault = form.get("isDefault") === "true";
+    const data = {
+      name,
+      keywords: String(form.get("keywords") ?? "").trim(),
+      realCost: parseAmount(form.get("realCost")),
+      isDefault,
+    };
+
+    const existing = await prisma.deliveryZone.findFirst({ where: { shop, name } });
+    if (existing) {
+      await prisma.deliveryZone.update({ where: { id: existing.id }, data });
+      if (isDefault) await clearOtherDefaults(shop, existing.id);
+    } else {
+      const created = await prisma.deliveryZone.create({ data: { shop, ...data } });
+      if (isDefault) await clearOtherDefaults(shop, created.id);
+    }
+    return { ok: true };
+  }
+
   if (intent === "delete") {
     await prisma.deliveryZone.deleteMany({ where: { id: String(form.get("id")), shop } });
     return { ok: true };
@@ -115,14 +204,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
   const fetcher = useFetcher<typeof action>();
-  const [templateId, setTemplateId] = useState("");
-  const [name, setName] = useState("");
-  const [keywords, setKeywords] = useState("");
+  const presets = buildZonePresets(zones);
+  const [selectedPresetKey, setSelectedPresetKey] = useState("");
   const [cost, setCost] = useState("");
   const busy = fetcher.state !== "idle";
+  const selectedPreset = presets.find((p) => p.key === selectedPresetKey) ?? null;
   const zoneOptions = [
-    { label: "Choose from your zones…", value: "" },
-    ...zones.map((z) => ({ label: z.name, value: z.id })),
+    { label: "Select zone…", value: "" },
+    ...presets.map((p) => ({ label: p.name, value: p.key })),
   ];
 
   return (
@@ -131,36 +220,19 @@ function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
         <Text as="h2" variant="headingMd">
           Add a delivery zone
         </Text>
-        <InlineGrid columns={{ xs: 1, sm: "1.5fr 1.5fr 2fr 1fr auto" }} gap="300">
+        <InlineGrid columns={{ xs: 1, sm: "2fr 1fr auto" }} gap="300">
           <Select
-            label="Zone template"
+            label="Zone"
             options={zoneOptions}
-            value={templateId}
+            value={selectedPresetKey}
             onChange={(value) => {
-              setTemplateId(value);
+              setSelectedPresetKey(value);
               if (!value) return;
-              const selected = zones.find((z) => z.id === value);
+              const selected = presets.find((p) => p.key === value);
               if (!selected) return;
-              setName(selected.name);
-              setKeywords(selected.keywords);
-              setCost(String(selected.realCost));
+              setCost(String(selected.existingCost ?? 0));
             }}
-            helpText="Pick from your existing zones, then edit name/keywords/cost before saving."
-          />
-          <TextField
-            label="Zone name"
-            value={name}
-            onChange={setName}
-            autoComplete="off"
-            placeholder="e.g. Cairo"
-          />
-          <TextField
-            label="Match keywords (comma separated)"
-            value={keywords}
-            onChange={setKeywords}
-            autoComplete="off"
-            placeholder="cairo, nasr city, maadi"
-            helpText="Matched against the order's city/governorate."
+            helpText="Choose a zone, then set its real courier cost."
           />
           <TextField
             label="Real cost"
@@ -175,20 +247,25 @@ function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
           <Box paddingBlockStart="600">
             <Button
               variant="primary"
-              disabled={!name.trim()}
+              disabled={!selectedPreset}
               loading={busy}
               onClick={() => {
+                if (!selectedPreset) return;
                 fetcher.submit(
-                  { _action: "create", name, keywords, realCost: cost || "0", isDefault: "false" },
+                  {
+                    _action: "savePrice",
+                    name: selectedPreset.name,
+                    keywords: selectedPreset.keywords,
+                    realCost: cost || "0",
+                    isDefault: String(selectedPreset.isDefault),
+                  },
                   { method: "post" },
                 );
-                setTemplateId("");
-                setName("");
-                setKeywords("");
+                setSelectedPresetKey("");
                 setCost("");
               }}
             >
-              Add
+              Save price
             </Button>
           </Box>
         </InlineGrid>
@@ -197,44 +274,20 @@ function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
   );
 }
 
-type Zone = {
-  id: string;
-  name: string;
-  keywords: string;
-  realCost: number;
-  isDefault: boolean;
-};
-
 function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currency: string }) {
   const fetcher = useFetcher<typeof action>();
-  const [name, setName] = useState(zone.name);
-  const [keywords, setKeywords] = useState(zone.keywords);
   const [cost, setCost] = useState(String(zone.realCost));
   const [isDefault, setIsDefault] = useState(zone.isDefault);
   const busy = fetcher.state !== "idle";
-  const dirty =
-    name !== zone.name ||
-    keywords !== zone.keywords ||
-    cost !== String(zone.realCost) ||
-    isDefault !== zone.isDefault;
+  const dirty = cost !== String(zone.realCost) || isDefault !== zone.isDefault;
 
   return (
     <IndexTable.Row id={zone.id} position={index}>
       <IndexTable.Cell>
         <InlineStack gap="200" blockAlign="center">
-          <TextField label="Name" labelHidden value={name} onChange={setName} autoComplete="off" />
+          <Text as="span">{zone.name}</Text>
           {zone.isDefault && <Badge tone="info">Default</Badge>}
         </InlineStack>
-      </IndexTable.Cell>
-      <IndexTable.Cell>
-        <TextField
-          label="Keywords"
-          labelHidden
-          value={keywords}
-          onChange={setKeywords}
-          autoComplete="off"
-          placeholder="(fallback for unmatched)"
-        />
       </IndexTable.Cell>
       <IndexTable.Cell>
         <Box maxWidth="130px">
@@ -265,8 +318,8 @@ function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currenc
                 {
                   _action: "update",
                   id: zone.id,
-                  name,
-                  keywords,
+                  name: zone.name,
+                  keywords: zone.keywords,
                   realCost: cost || "0",
                   isDefault: String(isDefault),
                 },
@@ -296,7 +349,6 @@ function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currenc
 
 export default function DeliveryPage() {
   const { zones, currency } = useLoaderData<typeof loader>();
-  const seedFetcher = useFetcher<typeof action>();
 
   return (
     <Page>
@@ -310,20 +362,6 @@ export default function DeliveryPage() {
             zone as <b>Default</b> to catch anything that doesn't match.
           </p>
         </Banner>
-
-        {zones.length === 0 && (
-          <Card>
-            <InlineStack align="space-between" blockAlign="center">
-              <Text as="span">New to this? Add a starter set of Egypt zones to fill in.</Text>
-              <Button
-                loading={seedFetcher.state !== "idle"}
-                onClick={() => seedFetcher.submit({ _action: "seed" }, { method: "post" })}
-              >
-                Add Egypt starter zones
-              </Button>
-            </InlineStack>
-          </Card>
-        )}
 
         <AddZone zones={zones} currency={currency} />
 
@@ -340,7 +378,6 @@ export default function DeliveryPage() {
               itemCount={zones.length}
               headings={[
                 { title: "Zone" },
-                { title: "Keywords" },
                 { title: "Real cost" },
                 { title: "Default" },
                 { title: "" },
