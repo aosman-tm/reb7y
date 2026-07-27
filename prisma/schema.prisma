@@ -142,6 +142,8 @@ model OrderCost {
   realDeliveryCost Float? // override; when null, resolved from the matching zone
   deliveryOutcome  String   @default("delivered") // delivered | rejected | returned
   roundTrip        Boolean  @default(false) // rejected/returned => paid shipping both ways
+  depositMode      String   @default("settings") // settings | none | fixed | percent_real | percent_shopify
+  depositValue     Float    @default(0) // amount or percent based on depositMode
   note             String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -162,6 +164,8 @@ model Settings {
   returnDeliveryMode    String   @default("full") // full | percent | fixed
   returnDeliveryPercent Float    @default(100) // used when mode = percent
   returnDeliveryFixed   Float    @default(0) // used when mode = fixed
+  depositMode           String   @default("none") // none | fixed | percent_real | percent_shopify
+  depositValue          Float    @default(0) // amount or percent based on depositMode
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 }

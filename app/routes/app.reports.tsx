@@ -39,6 +39,8 @@ function downloadOrdersCsv(report: Report) {
     "Materials",
     "ShippingCharged",
     "RealDelivery",
+    "DepositCollected",
+    "CourierNetLoss",
     "PaymentFee",
     "Profit",
     "City",
@@ -52,6 +54,8 @@ function downloadOrdersCsv(report: Report) {
     o.materialsCost,
     o.shippingCharged,
     o.realDelivery,
+    o.depositCollected,
+    o.courierNetLoss,
     o.paymentFee,
     o.profit,
     (o.city ?? "").replace(/[",\n]/g, " "),
@@ -133,6 +137,16 @@ export default function ReportsPage() {
                   <DetailRow
                     label="Real delivery cost paid"
                     value={formatMoney(report.totals.realDelivery, report.currency)}
+                  />
+                  <DetailRow
+                    label="Deposits recovered"
+                    value={formatMoney(report.totals.depositsRecovered, report.currency)}
+                    tone={report.totals.depositsRecovered > 0 ? "success" : undefined}
+                  />
+                  <DetailRow
+                    label="Rejected/returned courier net"
+                    value={formatMoney(report.totals.courierIssueNetLoss, report.currency)}
+                    tone={report.totals.courierIssueNetLoss > 0 ? "critical" : "success"}
                   />
                   <DetailRow
                     label="Lost on shipping (real > charged)"

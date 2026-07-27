@@ -11,6 +11,8 @@ export type ShopSettings = {
   returnDeliveryMode: string;
   returnDeliveryPercent: number;
   returnDeliveryFixed: number;
+  depositMode: string;
+  depositValue: number;
 };
 
 /** Get the shop's settings row, creating a default one on first use. */

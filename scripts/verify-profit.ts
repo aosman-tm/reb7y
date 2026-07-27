@@ -48,6 +48,8 @@ const settings: ShopSettings = {
   returnDeliveryMode: "full",
   returnDeliveryPercent: 100,
   returnDeliveryFixed: 0,
+  depositMode: "none",
+  depositValue: 0,
 };
 
 function order(overrides: Partial<NormalizedOrder>): NormalizedOrder {
@@ -91,6 +93,19 @@ check("real delivery (from zone)", a.realDelivery, 50);
 check("payment fee 2%", a.paymentFee, 6);
 check("delivery gap (40 charged - 50 real)", a.deliveryGap, -10);
 check("profit", a.profit, 226);
+console.log(`   source = ${a.realDeliverySource} (expected zone)`);
+if (a.realDeliverySource !== "zone") failures++;
+
+console.log("\n--- Fallback to Shopify shipping when real cost is missing ---");
+const fallback = computeOrderPnl(order({ city: null, province: null }), {
+  costMap,
+  zones: [],
+  settings,
+});
+check("fallback real delivery uses Shopify shipping", fallback.realDelivery, 40);
+check("fallback delivery gap is break-even", fallback.deliveryGap, 0);
+console.log(`   fallback source = ${fallback.realDeliverySource} (expected shopify)`);
+if (fallback.realDeliverySource !== "shopify") failures++;
 
 console.log("\n--- Rejected COD order, override 60 real, round-trip x2 ---");
 // not delivered => revenue 0, materials 0, delivery 60*2=120, fee 0 => profit -120
@@ -98,12 +113,34 @@ const b = computeOrderPnl(order({}), {
   costMap,
   zones,
   settings,
-  override: { realDeliveryCost: 60, deliveryOutcome: "rejected", roundTrip: true, note: null },
+  override: {
+    realDeliveryCost: 60,
+    deliveryOutcome: "rejected",
+    roundTrip: true,
+    depositMode: "settings",
+    depositValue: 0,
+    note: null,
+  },
 });
 check("revenue is 0 (no sale)", b.revenue, 0);
 check("materials is 0 (goods returned)", b.materialsCost, 0);
 check("delivery counted twice", b.realDelivery, 120);
 check("profit is the delivery loss", b.profit, -120);
+
+console.log("\n--- Returned order with deposit recovery ---");
+const withDeposit: ShopSettings = {
+  ...settings,
+  depositMode: "percent_real",
+  depositValue: 50,
+};
+const e = computeOrderPnl(order({ fulfillmentStatus: "RETURNED" }), {
+  costMap,
+  zones,
+  settings: withDeposit,
+});
+check("deposit collected (50% of 50)", e.depositCollected, 25);
+check("courier net loss after deposit", e.courierNetLoss, 75);
+check("profit includes recovered deposit", e.profit, -75);
 
 console.log("\n--- Missing recipe (product not costed) ---");
 const c = computeOrderPnl(

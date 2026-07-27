@@ -66,6 +66,8 @@ export type OrderOverride = {
   realDeliveryCost: number | null;
   deliveryOutcome: string; // delivered | rejected | returned
   roundTrip: boolean;
+  depositMode: string; // settings | none | fixed | percent_real | percent_shopify
+  depositValue: number;
   note: string | null;
 };
 
@@ -81,14 +83,21 @@ export type OrderPnl = {
   shippingCharged: number;
   materialsCost: number;
   realDelivery: number;
+  realDeliverySource: "override" | "zone" | "shopify";
+  realDeliverySourceLabel: string;
+  depositCollected: number; // deposit kept when order is rejected/returned
+  courierNetLoss: number; // realDelivery - depositCollected (negative means courier-side gain)
   deliveryGap: number; // shippingCharged - realDelivery (negative = you lose on shipping)
   paymentFee: number;
   discounts: number;
   refunds: number;
-  profit: number; // revenue - materials - realDelivery - paymentFee (BEFORE ad spend)
+  profit: number; // revenue + depositCollected - materials - realDelivery - paymentFee (BEFORE ad spend)
   zoneName: string | null;
   zoneCost: number; // the matched zone's real cost (before any override)
   overrideDelivery: number | null; // per-order override value, if the merchant set one
+  overrideDepositMode: string | null;
+  overrideDepositValue: number | null;
+  depositRule: string | null; // none | fixed | percent_real | percent_shopify
   returnDeliveryRule: string | null; // full | fixed | percent | mixed by products
   roundTrip: boolean; // effective round-trip flag used in this calc
   note: string | null;
@@ -115,6 +124,8 @@ export type ReportTotals = {
   margin: number; // netProfit / revenue
   shippingCharged: number;
   deliveryLoss: number; // sum of negative delivery gaps (money lost on shipping)
+  depositsRecovered: number; // sum of deposit collected on rejected/returned orders
+  courierIssueNetLoss: number; // sum(realDelivery - depositCollected) for rejected/returned orders
 };
 
 /** Per-product contribution over the period with shared shipping/fee allocation.
@@ -254,6 +265,53 @@ function formatRuleLabel(mode: string, percentOrFixed?: number): string {
   return "full";
 }
 
+function formatDepositRuleLabel(mode: string, value: number): string {
+  if (mode === "fixed") return `fixed (${round2(Math.max(0, value))})`;
+  if (mode === "percent_real") return `${clampPercent(value)}% of real courier`;
+  if (mode === "percent_shopify") return `${clampPercent(value)}% of Shopify shipping`;
+  return "none";
+}
+
+function resolveDepositAmount(
+  mode: string,
+  value: number,
+  order: NormalizedOrder,
+  baseDelivery: number,
+): { amount: number; label: string } {
+  if (mode === "fixed") {
+    return { amount: Math.max(0, value), label: formatDepositRuleLabel("fixed", value) };
+  }
+  if (mode === "percent_real") {
+    const pct = clampPercent(value);
+    return {
+      amount: baseDelivery * (pct / 100),
+      label: formatDepositRuleLabel("percent_real", pct),
+    };
+  }
+  if (mode === "percent_shopify") {
+    const pct = clampPercent(value);
+    return {
+      amount: order.shippingCharged * (pct / 100),
+      label: formatDepositRuleLabel("percent_shopify", pct),
+    };
+  }
+  return { amount: 0, label: formatDepositRuleLabel("none", 0) };
+}
+
+function resolveOrderDeposit(
+  order: NormalizedOrder,
+  baseDelivery: number,
+  settings: ShopSettings,
+  override?: OrderOverride | null,
+): { amount: number; label: string } {
+  const mode = override?.depositMode ?? "settings";
+  const value = override?.depositValue ?? 0;
+  if (mode !== "settings") {
+    return resolveDepositAmount(mode, value, order, baseDelivery);
+  }
+  return resolveDepositAmount(settings.depositMode, settings.depositValue, order, baseDelivery);
+}
+
 function inferOrderOutcome(order: NormalizedOrder): "delivered" | "rejected" | "returned" {
   const financial = (order.financialStatus ?? "").toUpperCase();
   const fulfillment = (order.fulfillmentStatus ?? "").toUpperCase();
@@ -354,9 +412,27 @@ export function computeOrderPnl(
     materialsCost += (delivered ? cost.unitCost : cost.returnMaterialUnitCost) * line.quantity;
   }
 
-  // --- Real delivery cost: per-order override first, else the matching zone. ---
+  // --- Real delivery cost: per-order override first, then matched zone, then Shopify shipping fallback. ---
   const zone = matchZone(order, zones);
-  const baseDelivery = override?.realDeliveryCost ?? zone?.realCost ?? 0;
+  const hasOverrideDelivery = override?.realDeliveryCost != null;
+  const zoneDelivery = zone?.realCost ?? 0;
+  const hasZoneDelivery = !hasOverrideDelivery && zoneDelivery > 0;
+  const baseDelivery = hasOverrideDelivery
+    ? (override?.realDeliveryCost ?? 0)
+    : hasZoneDelivery
+      ? zoneDelivery
+      : order.shippingCharged;
+  const realDeliverySource: "override" | "zone" | "shopify" = hasOverrideDelivery
+    ? "override"
+    : hasZoneDelivery
+      ? "zone"
+      : "shopify";
+  const realDeliverySourceLabel =
+    realDeliverySource === "override"
+      ? "manual real delivery"
+      : realDeliverySource === "zone"
+        ? `zone: ${zone?.name ?? "matched"}`
+        : "Shopify shipping";
   // Rejected / returned orders often mean you paid the courier both ways.
   const roundTrip = override?.roundTrip ?? (!delivered && settings.codRoundTripDefault);
   const roundTripDelivery = !delivered && roundTrip ? baseDelivery * 2 : baseDelivery;
@@ -364,6 +440,11 @@ export function computeOrderPnl(
     ? null
     : resolveReturnedOrderDelivery(order, roundTripDelivery, settings, costMap);
   const realDelivery = delivered ? roundTripDelivery : resolvedReturnDelivery?.amount ?? 0;
+
+  // --- Deposit recovery for failed orders (rejected/returned). ---
+  const resolvedDeposit = resolveOrderDeposit(order, baseDelivery, settings, override);
+  const depositCollected = delivered ? 0 : resolvedDeposit.amount;
+  const courierNetLoss = delivered ? 0 : realDelivery - depositCollected;
 
   // --- Revenue you keep: total minus tax (a pass-through). Zero if not delivered. ---
   const revenue = delivered ? Math.max(0, order.total - order.tax) : 0;
@@ -375,7 +456,7 @@ export function computeOrderPnl(
       : settings.paymentFeePercent;
   const paymentFee = revenue > 0 ? (revenue * feePercent) / 100 + settings.paymentFeeFlat : 0;
 
-  const profit = revenue - materialsCost - realDelivery - paymentFee;
+  const profit = revenue + depositCollected - materialsCost - realDelivery - paymentFee;
 
   return {
     orderId: order.id,
@@ -389,6 +470,10 @@ export function computeOrderPnl(
     shippingCharged: round2(order.shippingCharged),
     materialsCost: round2(materialsCost),
     realDelivery: round2(realDelivery),
+    realDeliverySource,
+    realDeliverySourceLabel,
+    depositCollected: round2(depositCollected),
+    courierNetLoss: round2(courierNetLoss),
     deliveryGap: round2(order.shippingCharged - realDelivery),
     paymentFee: round2(paymentFee),
     discounts: round2(order.discounts),
@@ -397,6 +482,9 @@ export function computeOrderPnl(
     zoneName: zone?.name ?? null,
     zoneCost: round2(zone?.realCost ?? 0),
     overrideDelivery: override?.realDeliveryCost ?? null,
+    overrideDepositMode: override?.depositMode ?? null,
+    overrideDepositValue: override?.depositValue ?? null,
+    depositRule: delivered ? null : resolvedDeposit.label,
     returnDeliveryRule: delivered ? null : resolvedReturnDelivery?.label ?? null,
     roundTrip,
     note: override?.note ?? null,
@@ -562,6 +650,8 @@ export async function buildReport(
         realDeliveryCost: o.realDeliveryCost,
         deliveryOutcome: o.deliveryOutcome,
         roundTrip: o.roundTrip,
+        depositMode: o.depositMode,
+        depositValue: o.depositValue,
         note: o.note,
       } as OrderOverride,
     ]),
@@ -659,6 +749,10 @@ export async function buildReport(
     shippingCharged: round2(orders.reduce((s, o) => s + o.shippingCharged, 0)),
     deliveryLoss: round2(
       orders.reduce((s, o) => s + (o.deliveryGap < 0 ? -o.deliveryGap : 0), 0),
+    ),
+    depositsRecovered: round2(orders.reduce((s, o) => s + o.depositCollected, 0)),
+    courierIssueNetLoss: round2(
+      orders.reduce((s, o) => s + (!o.delivered ? o.courierNetLoss : 0), 0),
     ),
     adSpend,
     overheads,

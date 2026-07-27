@@ -25,13 +25,22 @@ import { buildReport, type OrderPnl } from "../lib/profit.server";
 import { resolveRange } from "../lib/dates";
 import { parseAmount, formatMoney } from "../lib/money";
 import { RangeSelector } from "../components/RangeSelector";
+import { getSettings } from "../lib/settings.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
   const range = resolveRange(url.searchParams.get("range") ?? "all");
-  const report = await buildReport(admin, session.shop, range.start, range.end);
-  return { report, rangePreset: range.preset };
+  const [report, settings] = await Promise.all([
+    buildReport(admin, session.shop, range.start, range.end),
+    getSettings(session.shop),
+  ]);
+  return {
+    report,
+    rangePreset: range.preset,
+    settingsDepositMode: settings.depositMode,
+    settingsDepositValue: settings.depositValue,
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -48,11 +57,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (intent === "save") {
     const raw = String(form.get("realDeliveryCost") ?? "").trim();
+    const depositMode = String(form.get("depositMode") ?? "settings");
     const data = {
       name: String(form.get("name") ?? ""),
       realDeliveryCost: raw === "" ? null : parseAmount(raw),
       deliveryOutcome: String(form.get("outcome") ?? "delivered"),
       roundTrip: form.get("roundTrip") === "true",
+      depositMode,
+      depositValue: depositMode === "none" || depositMode === "settings"
+        ? 0
+        : parseAmount(form.get("depositValue"), 0),
       note: String(form.get("note") ?? "").trim() || null,
     };
     await prisma.orderCost.upsert({
@@ -72,6 +86,21 @@ const OUTCOMES = [
   { label: "Returned", value: "returned" },
 ];
 
+const DEPOSIT_OPTIONS = [
+  { label: "Use settings default", value: "settings" },
+  { label: "No deposit", value: "none" },
+  { label: "Fixed deposit amount", value: "fixed" },
+  { label: "% of real courier cost", value: "percent_real" },
+  { label: "% of Shopify shipping", value: "percent_shopify" },
+];
+
+function formatDepositMode(mode: string, value: number, currency: string): string {
+  if (mode === "fixed") return `${formatMoney(value, currency)} fixed`;
+  if (mode === "percent_real") return `${value}% of real courier`;
+  if (mode === "percent_shopify") return `${value}% of Shopify shipping`;
+  return "no deposit";
+}
+
 function shortDate(iso: string) {
   try {
     return new Date(iso).toLocaleDateString(undefined, {
@@ -84,7 +113,8 @@ function shortDate(iso: string) {
 }
 
 export default function OrdersPage() {
-  const { report, rangePreset } = useLoaderData<typeof loader>();
+  const { report, rangePreset, settingsDepositMode, settingsDepositValue } =
+    useLoaderData<typeof loader>();
   const [searchParams] = useSearchParams();
   const fetcher = useFetcher<typeof action>();
   const currency = report.currency;
@@ -99,13 +129,23 @@ export default function OrdersPage() {
   const [outcome, setOutcome] = useState("delivered");
   const [delivery, setDelivery] = useState("");
   const [roundTrip, setRoundTrip] = useState(false);
+  const [depositMode, setDepositMode] = useState("settings");
+  const [depositValue, setDepositValue] = useState("");
   const [note, setNote] = useState("");
+
+  const settingsDepositLabel = formatDepositMode(
+    settingsDepositMode,
+    settingsDepositValue,
+    currency,
+  );
 
   const openEdit = (o: OrderPnl) => {
     setEditing(o);
     setOutcome(o.outcome);
     setDelivery(o.overrideDelivery != null ? String(o.overrideDelivery) : "");
     setRoundTrip(o.roundTrip);
+    setDepositMode(o.overrideDepositMode ?? "settings");
+    setDepositValue(o.overrideDepositValue != null ? String(o.overrideDepositValue) : "");
     setNote(o.note ?? "");
   };
 
@@ -119,6 +159,8 @@ export default function OrdersPage() {
         realDeliveryCost: delivery,
         outcome,
         roundTrip: String(roundTrip),
+        depositMode,
+        depositValue,
         note,
       },
       { method: "post" },
@@ -173,6 +215,11 @@ export default function OrdersPage() {
               <Kpi label="Orders" value={String(report.totals.orderCount)} />
               <Kpi label="Revenue" value={formatMoney(report.totals.revenue, currency)} />
               <Kpi
+                label="Deposits recovered"
+                value={formatMoney(report.totals.depositsRecovered, currency)}
+                tone={report.totals.depositsRecovered > 0 ? "success" : undefined}
+              />
+              <Kpi
                 label="Net profit"
                 value={formatMoney(report.totals.netProfit, currency)}
                 tone={report.totals.netProfit >= 0 ? "success" : "critical"}
@@ -196,7 +243,7 @@ export default function OrdersPage() {
                 { title: "Order" },
                 { title: "Revenue" },
                 { title: "Materials" },
-                { title: "Delivery (real)" },
+                { title: "Courier progress" },
                 { title: "Fee" },
                 { title: "Profit" },
                 { title: "" },
@@ -232,7 +279,9 @@ export default function OrdersPage() {
                   <IndexTable.Cell>{formatMoney(o.materialsCost, currency)}</IndexTable.Cell>
                   <IndexTable.Cell>
                     <BlockStack gap="050">
-                      <Text as="span">{formatMoney(o.realDelivery, currency)}</Text>
+                      <Text as="span">
+                        real paid {formatMoney(o.realDelivery, currency)} · {o.realDeliverySourceLabel}
+                      </Text>
                       {o.delivered ? (
                         <Text
                           as="span"
@@ -252,12 +301,27 @@ export default function OrdersPage() {
                             : o.deliveryGap > 0
                               ? `profit ${formatMoney(o.deliveryGap, currency)}`
                               : "break-even"}
+                          {o.realDeliverySource === "shopify" ? " · from Shopify value" : ""}
                         </Text>
                       ) : (
-                        <Text as="span" variant="bodySm" tone="critical">
-                          {`lose ${formatMoney(o.realDelivery, currency)}`}
-                          {o.returnDeliveryRule ? ` · ${o.returnDeliveryRule}` : ""}
-                        </Text>
+                        <>
+                          <Text as="span" variant="bodySm" tone="success">
+                            deposit +{formatMoney(o.depositCollected, currency)}
+                            {o.depositRule ? ` · ${o.depositRule}` : ""}
+                          </Text>
+                          <Text
+                            as="span"
+                            variant="bodySm"
+                            tone={o.courierNetLoss > 0 ? "critical" : "success"}
+                          >
+                            {o.courierNetLoss > 0
+                              ? `net courier loss ${formatMoney(o.courierNetLoss, currency)}`
+                              : o.courierNetLoss < 0
+                                ? `net courier gain ${formatMoney(-o.courierNetLoss, currency)}`
+                                : "courier break-even"}
+                            {o.returnDeliveryRule ? ` · delivery ${o.returnDeliveryRule}` : ""}
+                          </Text>
+                        </>
                       )}
                     </BlockStack>
                   </IndexTable.Cell>
@@ -286,6 +350,30 @@ export default function OrdersPage() {
           <Text as="p" tone="subdued" alignment="center">
             Showing the most recent 10,000 orders in this range.
           </Text>
+        )}
+
+        {report.totals.rejectedCount > 0 && (
+          <Card>
+            <InlineStack align="space-between" blockAlign="center">
+              <Text as="span" variant="bodyMd">
+                Rejected/returned courier net
+              </Text>
+              <Text
+                as="span"
+                fontWeight="semibold"
+                tone={report.totals.courierIssueNetLoss > 0 ? "critical" : "success"}
+              >
+                {report.totals.courierIssueNetLoss > 0
+                  ? `loss ${formatMoney(report.totals.courierIssueNetLoss, currency)}`
+                  : report.totals.courierIssueNetLoss < 0
+                    ? `gain ${formatMoney(-report.totals.courierIssueNetLoss, currency)}`
+                    : "break-even"}
+              </Text>
+            </InlineStack>
+            <Text as="p" tone="subdued" variant="bodySm">
+              Based on real courier cost minus recovered deposits from failed deliveries.
+            </Text>
+          </Card>
         )}
       </BlockStack>
 
@@ -331,11 +419,34 @@ export default function OrdersPage() {
                 }
               />
               {outcome !== "delivered" && (
-                <Checkbox
-                  label="Paid the courier both ways (count delivery ×2)"
-                  checked={roundTrip}
-                  onChange={setRoundTrip}
-                />
+                <BlockStack gap="300">
+                  <Checkbox
+                    label="Paid the courier both ways (count delivery ×2)"
+                    checked={roundTrip}
+                    onChange={setRoundTrip}
+                  />
+                  <Select
+                    label="Deposit collection rule"
+                    options={DEPOSIT_OPTIONS}
+                    value={depositMode}
+                    onChange={setDepositMode}
+                    helpText={`Settings default: ${settingsDepositLabel}. Deposit is added as recovered money on rejected/returned orders.`}
+                  />
+                  {depositMode !== "none" && depositMode !== "settings" && (
+                    <TextField
+                      label={depositMode === "fixed" ? "Deposit amount" : "Deposit percentage"}
+                      type="number"
+                      value={depositValue}
+                      onChange={setDepositValue}
+                      autoComplete="off"
+                      prefix={depositMode === "fixed" ? currency : undefined}
+                      suffix={depositMode === "fixed" ? undefined : "%"}
+                      min={0}
+                      max={depositMode === "fixed" ? undefined : 100}
+                      step={depositMode === "fixed" ? 0.01 : 1}
+                    />
+                  )}
+                </BlockStack>
               )}
               <TextField
                 label="Note (optional)"
