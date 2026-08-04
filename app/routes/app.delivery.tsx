@@ -22,32 +22,34 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
 import { parseAmount } from "../lib/money";
+import { fetchShopifyDeliveryZones, type ShopifyZonePreset } from "../lib/shipping.server";
 
-// Starter zones for Egypt — keywords match Shopify's shipping city/province text.
-const EGYPT_STARTER = [
-  { name: "Cairo", keywords: "cairo,القاهرة", realCost: 0, isDefault: false },
+// Fallback zones for Egypt, used only when Shopify's own shipping zones can't be
+// read (missing `read_shipping` scope, or none configured yet). Keywords match
+// Shopify's shipping city/province text.
+const EGYPT_STARTER: ShopifyZonePreset[] = [
+  { name: "Cairo", keywords: "cairo,القاهرة", isDefault: false },
   {
     name: "Giza",
     keywords: "giza,الجيزة,6th of october,6 october,sheikh zayed",
-    realCost: 0,
     isDefault: false,
   },
-  { name: "Alexandria", keywords: "alexandria,الاسكندرية,اسكندرية", realCost: 0, isDefault: false },
+  { name: "Alexandria", keywords: "alexandria,الاسكندرية,اسكندرية", isDefault: false },
   {
     name: "Delta",
     keywords:
       "mansoura,tanta,zagazig,damietta,dakahlia,gharbia,menoufia,qalyubia,sharqia,kafr el sheikh,beheira,ismailia,port said,suez",
-    realCost: 0,
     isDefault: false,
   },
   {
     name: "Upper Egypt",
     keywords: "aswan,luxor,asyut,sohag,qena,minya,beni suef,fayoum,red sea,hurghada",
-    realCost: 0,
     isDefault: false,
   },
-  { name: "Other (rest of Egypt)", keywords: "", realCost: 0, isDefault: true },
+  { name: "Other (rest of Egypt)", keywords: "", isDefault: true },
 ];
+
+const CUSTOM_ZONE_KEY = "__custom__";
 
 type Zone = {
   id: string;
@@ -70,10 +72,12 @@ function normalizeZoneKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function buildZonePresets(zones: Zone[]): ZonePreset[] {
+/** Merge zones read live from Shopify (or the fallback list) with prices already saved in the app. */
+function buildZonePresets(zones: Zone[], shopifyZones: ShopifyZonePreset[]): ZonePreset[] {
   const map = new Map<string, ZonePreset>();
+  const source = shopifyZones.length > 0 ? shopifyZones : EGYPT_STARTER;
 
-  for (const starter of EGYPT_STARTER) {
+  for (const starter of source) {
     const key = normalizeZoneKey(starter.name);
     map.set(key, {
       key,
@@ -117,15 +121,21 @@ function buildZonePresets(zones: Zone[]): ZonePreset[] {
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  const [zones, settings] = await Promise.all([
+  const { admin, session } = await authenticate.admin(request);
+  const [zones, settings, shopifyZonesResult] = await Promise.all([
     prisma.deliveryZone.findMany({
       where: { shop: session.shop },
       orderBy: [{ isDefault: "desc" }, { name: "asc" }],
     }),
     getSettings(session.shop),
+    fetchShopifyDeliveryZones(admin),
   ]);
-  return { zones, currency: settings.currency };
+  return {
+    zones,
+    currency: settings.currency,
+    shopifyZones: shopifyZonesResult.zones,
+    shopifyZonesError: shopifyZonesResult.error,
+  };
 };
 
 async function clearOtherDefaults(shop: string, keepId?: string) {
@@ -145,7 +155,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const count = await prisma.deliveryZone.count({ where: { shop } });
     if (count === 0) {
       await prisma.deliveryZone.createMany({
-        data: EGYPT_STARTER.map((z) => ({ shop, ...z })),
+        data: EGYPT_STARTER.map((z) => ({ shop, name: z.name, keywords: z.keywords, isDefault: z.isDefault, realCost: 0 })),
       });
     }
     return { ok: true };
@@ -202,17 +212,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { error: "Unknown action." };
 };
 
-function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
+function AddZone({
+  zones,
+  currency,
+  shopifyZones,
+  usingLiveZones,
+}: {
+  zones: Zone[];
+  currency: string;
+  shopifyZones: ShopifyZonePreset[];
+  usingLiveZones: boolean;
+}) {
   const fetcher = useFetcher<typeof action>();
-  const presets = buildZonePresets(zones);
+  const presets = buildZonePresets(zones, shopifyZones);
   const [selectedPresetKey, setSelectedPresetKey] = useState("");
+  const [customName, setCustomName] = useState("");
   const [cost, setCost] = useState("");
   const busy = fetcher.state !== "idle";
+  const isCustom = selectedPresetKey === CUSTOM_ZONE_KEY;
   const selectedPreset = presets.find((p) => p.key === selectedPresetKey) ?? null;
   const zoneOptions = [
     { label: "Select zone…", value: "" },
     ...presets.map((p) => ({ label: p.name, value: p.key })),
+    { label: "Custom zone (type name)…", value: CUSTOM_ZONE_KEY },
   ];
+  const readyName = isCustom ? customName.trim() : (selectedPreset?.name ?? "");
+  const canSave = isCustom ? readyName.length > 0 : Boolean(selectedPreset);
 
   return (
     <Card>
@@ -227,12 +252,20 @@ function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
             value={selectedPresetKey}
             onChange={(value) => {
               setSelectedPresetKey(value);
-              if (!value) return;
+              setCustomName("");
+              if (!value || value === CUSTOM_ZONE_KEY) {
+                setCost("0");
+                return;
+              }
               const selected = presets.find((p) => p.key === value);
               if (!selected) return;
               setCost(String(selected.existingCost ?? 0));
             }}
-            helpText="Choose a zone, then set its real courier cost."
+            helpText={
+              usingLiveZones
+                ? "Pulled live from your Shopify shipping zones. Pick Custom to type an exact name instead."
+                : "We couldn't read your Shopify shipping zones yet, so this list is a starting point — pick Custom to type the exact zone name from Shopify."
+            }
           />
           <TextField
             label="Real cost"
@@ -247,21 +280,22 @@ function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
           <Box paddingBlockStart="600">
             <Button
               variant="primary"
-              disabled={!selectedPreset}
+              disabled={!canSave}
               loading={busy}
               onClick={() => {
-                if (!selectedPreset) return;
+                if (!canSave) return;
                 fetcher.submit(
                   {
                     _action: "savePrice",
-                    name: selectedPreset.name,
-                    keywords: selectedPreset.keywords,
+                    name: readyName,
+                    keywords: isCustom ? "" : (selectedPreset?.keywords ?? ""),
                     realCost: cost || "0",
-                    isDefault: String(selectedPreset.isDefault),
+                    isDefault: isCustom ? "false" : String(selectedPreset?.isDefault ?? false),
                   },
                   { method: "post" },
                 );
                 setSelectedPresetKey("");
+                setCustomName("");
                 setCost("");
               }}
             >
@@ -269,6 +303,15 @@ function AddZone({ zones, currency }: { zones: Zone[]; currency: string }) {
             </Button>
           </Box>
         </InlineGrid>
+        {isCustom && (
+          <TextField
+            label="Zone name"
+            value={customName}
+            onChange={setCustomName}
+            autoComplete="off"
+            placeholder="Type the exact zone name from your Shopify shipping settings"
+          />
+        )}
       </BlockStack>
     </Card>
   );
@@ -348,7 +391,8 @@ function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currenc
 }
 
 export default function DeliveryPage() {
-  const { zones, currency } = useLoaderData<typeof loader>();
+  const { zones, currency, shopifyZones, shopifyZonesError } = useLoaderData<typeof loader>();
+  const usingLiveZones = shopifyZones.length > 0;
 
   return (
     <Page>
@@ -363,7 +407,24 @@ export default function DeliveryPage() {
           </p>
         </Banner>
 
-        <AddZone zones={zones} currency={currency} />
+        {!usingLiveZones && (
+          <Banner tone="warning">
+            <p>
+              We couldn't read the shipping zones from your Shopify admin
+              {shopifyZonesError ? ` (${shopifyZonesError})` : ""}. This usually means the app needs
+              to be reinstalled to grant the new shipping permission. In the meantime, pick{" "}
+              <b>Custom zone</b> below and type the exact zone name from Shopify's{" "}
+              <b>Settings → Shipping and delivery</b> page.
+            </p>
+          </Banner>
+        )}
+
+        <AddZone
+          zones={zones}
+          currency={currency}
+          shopifyZones={shopifyZones}
+          usingLiveZones={usingLiveZones}
+        />
 
         <Card padding="0">
           {zones.length === 0 ? (
