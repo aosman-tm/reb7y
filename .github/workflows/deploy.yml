@@ -50,8 +50,16 @@ jobs:
           DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          # tr -d '\r': a key copied on Windows arrives with CRLF endings, which
+          # OpenSSH rejects as a malformed key.
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
+            echo "::error::VPS_SSH_KEY is not a valid OpenSSH private key."
+            echo "Re-copy the whole file, including the BEGIN and END lines:"
+            echo "  cat ~/.ssh/reb7y_deploy"
+            exit 1
+          fi
           # Host key pinned so we are not trusting whatever answers on first connect.
           printf '%s\n' '162.35.184.237 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOsXOQA1Z+Mj8h7Oz7P8OyrL0dq1UQKHWRBRqx+mdiYb' > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
@@ -59,8 +67,8 @@ jobs:
       - name: Deploy
         if: steps.check.outputs.skip == 'false'
         run: |
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" \
-            '/srv/reb7y/run-deploy.sh'
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o ConnectTimeout=15 "$VPS_USER@$VPS_HOST" '/srv/reb7y/run-deploy.sh'
 
       - name: Clean up key
         if: always()
