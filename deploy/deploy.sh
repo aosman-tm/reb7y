@@ -16,7 +16,7 @@ echo "==> Building app"
 npm run build
 
 echo "==> Restarting service"
-sudo /bin/systemctl restart reb7y
+sudo systemctl restart reb7y
 
 echo "==> Waiting for app to come up"
 for i in $(seq 1 30); do
@@ -27,10 +27,10 @@ for i in $(seq 1 30); do
   fi
   if [ "$i" -eq 30 ]; then
     echo "ERROR: app did not respond within 30s" >&2
-    sudo /bin/systemctl status reb7y --no-pager -l || true
+    sudo systemctl status reb7y --no-pager -l || true
     exit 1
   fi
   sleep 1
 done
 
-sudo /bin/systemctl is-active --quiet reb7y && echo "==> Deploy OK"
+sudo systemctl is-active --quiet reb7y && echo "==> Deploy OK"

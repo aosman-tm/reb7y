@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# One-time VPS provisioning for reb7y. Run as root on a fresh Ubuntu server.
-#   bash setup-server.sh
+# One-time VPS provisioning for reb7y.
+# Target: AlmaLinux 9 (InterServer VPS, shipped with an unused DirectAdmin stack).
+# Run as root:  bash setup-server.sh
 set -euo pipefail
 
 APP_DOMAIN="162-35-184-237.sslip.io"
@@ -9,56 +10,69 @@ APP_HOME="/srv/reb7y"
 APP_DIR="$APP_HOME/app"
 DATA_DIR="/var/lib/reb7y"
 
-echo "############ 1. Base packages ############"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y curl git ca-certificates gnupg ufw sudo \
-  debian-keyring debian-archive-keyring apt-transport-https
+echo "############ 1. Free ports 80/443 and RAM from the unused DirectAdmin stack ############"
+# Reversible: `systemctl enable --now <name>` brings any of these back.
+DA_SERVICES="directadmin httpd exim dovecot named mysqld mariadb pure-ftpd pure-certd spamassassin php-fpm74 php-fpm83"
+for svc in $DA_SERVICES; do
+  if systemctl list-unit-files --no-legend "${svc}.service" 2>/dev/null | grep -q .; then
+    systemctl disable --now "$svc" 2>/dev/null && echo "  disabled $svc" || echo "  skipped $svc"
+  fi
+done
+# Stop DirectAdmin's cron from resurrecting the services it monitors.
+for f in /etc/cron.d/directadmin_cron /etc/cron.d/directadmin; do
+  [ -f "$f" ] && mv "$f" "$f.disabled" && echo "  disabled cron $f"
+done
+echo "  NOTE: csf/lfd firewall left running on purpose."
 
-echo "############ 2. Swap (protects small VPS from OOM during builds) ############"
-if ! swapon --show | grep -q '/swapfile'; then
+echo "############ 2. Extra swap (protects the build on a 1 CPU / 1.7 GB box) ############"
+if ! swapon --show=NAME --noheadings | grep -q '/swapfile'; then
   fallocate -l 2G /swapfile
   chmod 600 /swapfile
-  mkswap /swapfile
+  mkswap /swapfile >/dev/null
   swapon /swapfile
-  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "  added 2G swapfile"
 fi
+free -h
 
-echo "############ 3. Node.js 22 LTS ############"
-if ! command -v node >/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 22 ]; then
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
+echo "############ 3. Base packages ############"
+dnf install -y -q git curl sudo tar 'dnf-command(copr)'
+
+echo "############ 4. Node.js 22 LTS ############"
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | tr -d 'v' | cut -d. -f1)" -lt 22 ]; then
+  curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+  dnf install -y nodejs
 fi
-node -v && npm -v
+echo "  node $(node -v) / npm $(npm -v)"
 
-echo "############ 4. Deploy user ############"
+echo "############ 5. Deploy user ############"
 if ! id deploy >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "$APP_HOME" --shell /bin/bash deploy
 fi
 mkdir -p "$APP_HOME/.ssh" "$DATA_DIR"
 chmod 700 "$APP_HOME/.ssh"
-# Reuse the key already authorised for root so CI can log in as deploy.
+# Reuse the key already authorised for root so GitHub Actions can log in as deploy.
 if [ -f /root/.ssh/authorized_keys ]; then
   cp /root/.ssh/authorized_keys "$APP_HOME/.ssh/authorized_keys"
+  chmod 600 "$APP_HOME/.ssh/authorized_keys"
 fi
-chmod 600 "$APP_HOME/.ssh/authorized_keys"
 chown -R deploy:deploy "$APP_HOME" "$DATA_DIR"
 
-# Allow the deploy user to restart ONLY this one service.
+# The deploy user may restart ONLY this one service - nothing else.
 cat > /etc/sudoers.d/reb7y <<'EOF'
-deploy ALL=(root) NOPASSWD: /bin/systemctl restart reb7y, /bin/systemctl status reb7y, /bin/systemctl is-active reb7y
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart reb7y, /usr/bin/systemctl status reb7y, /usr/bin/systemctl is-active reb7y
 EOF
 chmod 440 /etc/sudoers.d/reb7y
-visudo -c -f /etc/sudoers.d/reb7y
+visudo -cf /etc/sudoers.d/reb7y
 
-echo "############ 5. Clone repository ############"
+echo "############ 6. Clone repository ############"
 if [ ! -d "$APP_DIR/.git" ]; then
-  sudo -u deploy git clone "$REPO_URL" "$APP_DIR"
+  sudo -u deploy git clone --quiet "$REPO_URL" "$APP_DIR"
 fi
-sudo -u deploy git -C "$APP_DIR" fetch --prune origin
-sudo -u deploy git -C "$APP_DIR" reset --hard origin/main
+sudo -u deploy git -C "$APP_DIR" fetch --quiet --prune origin
+sudo -u deploy git -C "$APP_DIR" reset --quiet --hard origin/main
 
-echo "############ 6. Environment file ############"
+echo "############ 7. Environment file ############"
 if [ ! -f "$APP_HOME/.env" ]; then
   cat > "$APP_HOME/.env" <<EOF
 NODE_ENV=production
@@ -69,37 +83,29 @@ SHOPIFY_API_SECRET=REPLACE_ME
 SCOPES=read_orders,read_all_orders,read_products,read_locations,read_shipping
 DATABASE_URL=file:$DATA_DIR/prod.sqlite
 EOF
+  echo "  created $APP_HOME/.env (SHOPIFY_API_SECRET still needs the real value)"
 fi
 chown deploy:deploy "$APP_HOME/.env"
 chmod 600 "$APP_HOME/.env"
 
-echo "############ 7. systemd service ############"
+echo "############ 8. systemd service ############"
 install -m 644 "$APP_DIR/deploy/reb7y.service" /etc/systemd/system/reb7y.service
 systemctl daemon-reload
-systemctl enable reb7y
+systemctl enable --quiet reb7y
 
-echo "############ 8. Caddy (automatic HTTPS) ############"
-if ! command -v caddy >/dev/null; then
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-  apt-get update -y
-  apt-get install -y caddy
+echo "############ 9. Caddy (automatic HTTPS) ############"
+if ! command -v caddy >/dev/null 2>&1; then
+  dnf copr enable -y @caddy/caddy
+  dnf install -y caddy
 fi
 mkdir -p /var/log/caddy && chown caddy:caddy /var/log/caddy
 install -m 644 "$APP_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
-systemctl enable caddy
-
-echo "############ 9. Firewall ############"
-ufw allow OpenSSH
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
+systemctl enable --quiet caddy
 
 echo
 echo "=========================================================="
-echo "Base setup complete."
-echo "Next: put the real SHOPIFY_API_SECRET into $APP_HOME/.env"
-echo "then run the first build."
+echo "Server provisioning complete."
+echo "Ports 80/443 are now free for Caddy."
+echo "Next: set the real SHOPIFY_API_SECRET in $APP_HOME/.env,"
+echo "      then run the first build."
 echo "=========================================================="
