@@ -59,8 +59,10 @@ fi
 chown -R deploy:deploy "$APP_HOME" "$DATA_DIR"
 
 # The deploy user may restart ONLY this one service - nothing else.
+# Reading service state (status/is-active/journalctl) needs no privileges,
+# so restart is the single command that has to be granted.
 cat > /etc/sudoers.d/reb7y <<'EOF'
-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart reb7y, /usr/bin/systemctl status reb7y, /usr/bin/systemctl is-active reb7y
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart reb7y
 EOF
 chmod 440 /etc/sudoers.d/reb7y
 visudo -cf /etc/sudoers.d/reb7y

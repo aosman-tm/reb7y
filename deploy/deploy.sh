@@ -43,10 +43,12 @@ for i in $(seq 1 30); do
   fi
   if [ "$i" -eq 30 ]; then
     echo "ERROR: app did not respond within 30s" >&2
-    sudo systemctl status reb7y --no-pager -l || true
+    # Reading service state needs no privileges - only `restart` does.
+    systemctl status reb7y --no-pager -l || true
+    journalctl -u reb7y --no-pager -n 40 || true
     exit 1
   fi
   sleep 1
 done
 
-sudo systemctl is-active --quiet reb7y && echo "==> Deploy OK"
+systemctl is-active --quiet reb7y && echo "==> Deploy OK"
