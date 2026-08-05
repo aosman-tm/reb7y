@@ -52,8 +52,81 @@ model Material {
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   bomLines          BomLine[]
+  prices            MaterialPrice[]
 
   @@index([shop])
+}
+
+// ---------------------------------------------------------------------------
+// Dated cost history
+//
+// Costs change over time, and a report must show what an order ACTUALLY cost
+// when it happened. Without this, raising a box from 15 to 17 EGP silently
+// rewrites the profit of every order ever placed.
+//
+// The Material / ProductCost / DeliveryZone rows above stay the "current"
+// values the merchant edits. The tables below record what each cost was from a
+// given day onward, and the reports resolve every order against its own date.
+//
+// Resolution rule (see resolveAsOf in app/lib/costHistory.server.ts):
+//   - use the newest entry whose effectiveFrom is on or before the order's day
+//   - if the order predates every entry, use the OLDEST entry, so entering
+//     costs today does not leave last month's orders with no cost at all
+// ---------------------------------------------------------------------------
+
+/// What one unit of a material cost from `effectiveFrom` onward.
+model MaterialPrice {
+  id            String   @id @default(cuid())
+  shop          String
+  materialId    String
+  material      Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  costPerUnit   Float
+  effectiveFrom String // YYYY-MM-DD
+  note          String?
+  createdAt     DateTime @default(now())
+
+  // One price per material per day: editing twice in a day replaces the entry
+  // rather than leaving two rows competing for the same date.
+  @@unique([shop, materialId, effectiveFrom])
+  @@index([shop, materialId, effectiveFrom])
+}
+
+/// What one unit of a product cost from `effectiveFrom` onward — a complete
+/// snapshot, so a later recipe or material change cannot alter it.
+/// Rewritten whenever a material price, a recipe line, or the product's own
+/// factory/other cost changes.
+model ProductCostVersion {
+  id                    String   @id @default(cuid())
+  shop                  String
+  productId             String // Shopify product GID
+  effectiveFrom         String // YYYY-MM-DD
+  materialCost          Float    @default(0) // sum of recipe lines at this date
+  returnMaterialCost    Float    @default(0) // only lines flagged countOnReturn
+  factoryCost           Float    @default(0)
+  otherCost             Float    @default(0)
+  returnDeliveryMode    String   @default("settings")
+  returnDeliveryPercent Float    @default(100)
+  /// What triggered this version: edit | material | recipe | seed
+  reason                String   @default("edit")
+  createdAt             DateTime @default(now())
+
+  @@unique([shop, productId, effectiveFrom])
+  @@index([shop, productId, effectiveFrom])
+}
+
+/// The real courier cost of a delivery zone from `effectiveFrom` onward.
+model DeliveryZonePrice {
+  id            String       @id @default(cuid())
+  shop          String
+  zoneId        String
+  zone          DeliveryZone @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+  realCost      Float
+  effectiveFrom String // YYYY-MM-DD
+  note          String?
+  createdAt     DateTime     @default(now())
+
+  @@unique([shop, zoneId, effectiveFrom])
+  @@index([shop, zoneId, effectiveFrom])
 }
 
 /// A custom measurement unit the merchant added (on top of the built-in ones).
@@ -127,6 +200,7 @@ model DeliveryZone {
   isDefault Boolean  @default(false) // fallback when no zone matches the address
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  prices    DeliveryZonePrice[]
 
   @@index([shop])
 }

@@ -23,6 +23,13 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
 import { parseAmount, formatMoney, round2 } from "../lib/money";
+import {
+  recordProductCostChange,
+  seedCostHistory,
+  type ApplyMode,
+} from "../lib/costHistory.server";
+import { todayString } from "../lib/dates";
+import { PriceChangeModal } from "../components/PriceChangeModal";
 
 const PRODUCT_QUERY = `#graphql
   query Reb7yProduct($id: ID!) {
@@ -89,6 +96,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     unitCost,
     margin: round2(price - unitCost),
     currency: settings.currency,
+    today: todayString(),
     returnDeliveryMode: productCost?.returnDeliveryMode ?? "settings",
     returnDeliveryPercent: round2(productCost?.returnDeliveryPercent ?? 100),
     settingsReturnDeliveryMode: settings.returnDeliveryMode,
@@ -112,41 +120,79 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       update: { title },
     });
 
+  /**
+   * Apply a cost change while keeping the dated history correct.
+   *
+   * Seeding runs first, on purpose: it records the product's CURRENT cost as
+   * its historical baseline, so it has to happen before the new value lands.
+   * Without that, past orders would silently adopt the new cost.
+   */
+  const withHistory = async (
+    mutate: () => Promise<void>,
+    opts: { mode: ApplyMode; chosenDay?: string | null; reason: string },
+  ) => {
+    await seedCostHistory(shop);
+    await mutate();
+    await recordProductCostChange({
+      shop,
+      productId: gid,
+      mode: opts.mode,
+      chosenDay: opts.chosenDay,
+      reason: opts.reason,
+    });
+  };
+
   if (intent === "addLine") {
     const materialId = String(form.get("materialId") ?? "");
     if (!materialId) return { error: "Pick a material." };
-    const pc = await ensureProductCost(String(form.get("title") ?? ""));
-    await prisma.bomLine.create({
-      data: {
-        productCostId: pc.id,
-        materialId,
-        quantity: parseAmount(form.get("quantity"), 1),
+    await withHistory(
+      async () => {
+        const pc = await ensureProductCost(String(form.get("title") ?? ""));
+        await prisma.bomLine.create({
+          data: {
+            productCostId: pc.id,
+            materialId,
+            quantity: parseAmount(form.get("quantity"), 1),
+          },
+        });
       },
-    });
+      { mode: "today", reason: "recipe" },
+    );
     return { ok: true };
   }
 
   if (intent === "saveExtras") {
     const returnDeliveryMode = String(form.get("returnDeliveryMode") ?? "settings");
     const returnDeliveryPercent = parseAmount(form.get("returnDeliveryPercent"), 100);
-    await prisma.productCost.upsert({
-      where: { shop_productId: { shop, productId: gid } },
-      create: {
-        shop,
-        productId: gid,
-        title: String(form.get("title") ?? ""),
-        factoryCost: parseAmount(form.get("factoryCost")),
-        otherCost: parseAmount(form.get("otherCost")),
-        returnDeliveryMode,
-        returnDeliveryPercent,
+    const raw = String(form.get("applyMode") ?? "today");
+    const mode: ApplyMode = raw === "date" || raw === "correct" ? raw : "today";
+    await withHistory(
+      async () => {
+        await prisma.productCost.upsert({
+          where: { shop_productId: { shop, productId: gid } },
+          create: {
+            shop,
+            productId: gid,
+            title: String(form.get("title") ?? ""),
+            factoryCost: parseAmount(form.get("factoryCost")),
+            otherCost: parseAmount(form.get("otherCost")),
+            returnDeliveryMode,
+            returnDeliveryPercent,
+          },
+          update: {
+            factoryCost: parseAmount(form.get("factoryCost")),
+            otherCost: parseAmount(form.get("otherCost")),
+            returnDeliveryMode,
+            returnDeliveryPercent,
+          },
+        });
       },
-      update: {
-        factoryCost: parseAmount(form.get("factoryCost")),
-        otherCost: parseAmount(form.get("otherCost")),
-        returnDeliveryMode,
-        returnDeliveryPercent,
+      {
+        mode,
+        chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+        reason: "edit",
       },
-    });
+    );
     return { ok: true };
   }
 
@@ -158,14 +204,19 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       include: { productCost: true },
     });
     if (!line || line.productCost.shop !== shop) return { error: "Not found." };
-    if (intent === "updateLine") {
-      await prisma.bomLine.update({
-        where: { id: lineId },
-        data: { quantity: parseAmount(form.get("quantity"), 1) },
-      });
-    } else {
-      await prisma.bomLine.delete({ where: { id: lineId } });
-    }
+    await withHistory(
+      async () => {
+        if (intent === "updateLine") {
+          await prisma.bomLine.update({
+            where: { id: lineId },
+            data: { quantity: parseAmount(form.get("quantity"), 1) },
+          });
+        } else {
+          await prisma.bomLine.delete({ where: { id: lineId } });
+        }
+      },
+      { mode: "today", reason: "recipe" },
+    );
     return { ok: true };
   }
 
@@ -176,10 +227,15 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       include: { productCost: true },
     });
     if (!line || line.productCost.shop !== shop) return { error: "Not found." };
-    await prisma.bomLine.update({
-      where: { id: lineId },
-      data: { countOnReturn: form.get("countOnReturn") === "true" },
-    });
+    await withHistory(
+      async () => {
+        await prisma.bomLine.update({
+          where: { id: lineId },
+          data: { countOnReturn: form.get("countOnReturn") === "true" },
+        });
+      },
+      { mode: "today", reason: "recipe" },
+    );
     return { ok: true };
   }
 
@@ -301,6 +357,28 @@ export default function ProductCostEditor() {
   const [returnDeliveryPercent, setReturnDeliveryPercent] = useState(
     String(data.returnDeliveryPercent),
   );
+  const [askWhen, setAskWhen] = useState(false);
+
+  const oldExtras = round2(data.factoryCost + data.otherCost);
+  const newExtras = round2(parseFloat(factory || "0") + parseFloat(other || "0"));
+  const extrasChanged = newExtras !== oldExtras;
+
+  const saveExtras = (applyMode: string, applyDay: string) => {
+    otherFetcher.submit(
+      {
+        _action: "saveExtras",
+        factoryCost: factory || "0",
+        otherCost: other || "0",
+        returnDeliveryMode,
+        returnDeliveryPercent: returnDeliveryPercent || "100",
+        title: data.product.title,
+        applyMode,
+        applyDay,
+      },
+      { method: "post" },
+    );
+    setAskWhen(false);
+  };
 
   const { product, lines, materials, currency } = data;
   const materialOptions = [
@@ -373,9 +451,15 @@ export default function ProductCostEditor() {
 
         <Card padding="0">
           <Box padding="400">
-            <Text as="h3" variant="headingMd">
-              Recipe
-            </Text>
+            <BlockStack gap="100">
+              <Text as="h3" variant="headingMd">
+                Recipe
+              </Text>
+              <Text as="p" tone="subdued" variant="bodySm">
+                Recipe changes count from today onward. Orders you already made keep the recipe and
+                prices they were made with, so your past reports stay the same.
+              </Text>
+            </BlockStack>
           </Box>
           {lines.length === 0 ? (
             <Box paddingInline="400" paddingBlockEnd="400">
@@ -502,19 +586,12 @@ export default function ProductCostEditor() {
               <Box paddingBlockStart="600">
                 <Button
                   loading={otherFetcher.state !== "idle"}
-                  onClick={() =>
-                    otherFetcher.submit(
-                      {
-                        _action: "saveExtras",
-                        factoryCost: factory || "0",
-                        otherCost: other || "0",
-                        returnDeliveryMode,
-                        returnDeliveryPercent: returnDeliveryPercent || "100",
-                        title: product.title,
-                      },
-                      { method: "post" },
-                    )
-                  }
+                  onClick={() => {
+                    // Only interrupt when the money changed; the return-delivery
+                    // rule alone does not restate what a past order cost to make.
+                    if (extrasChanged) setAskWhen(true);
+                    else saveExtras("today", data.today);
+                  }}
                 >
                   Save
                 </Button>
@@ -561,6 +638,19 @@ export default function ProductCostEditor() {
           </BlockStack>
         </Card>
       </BlockStack>
+
+      {askWhen && (
+        <PriceChangeModal
+          open
+          itemName={`${data.product.title} factory + other cost`}
+          oldValue={oldExtras}
+          newValue={newExtras}
+          currency={currency}
+          today={data.today}
+          onCancel={() => setAskWhen(false)}
+          onConfirm={saveExtras}
+        />
+      )}
     </Page>
   );
 }

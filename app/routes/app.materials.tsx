@@ -23,7 +23,15 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
 import { computeMaterialUsage } from "../lib/profit.server";
-import { parseAmount, formatMoney, round2 } from "../lib/money";
+import {
+  recordMaterialPrice,
+  seedCostHistory,
+  EARLIEST_DAY,
+  type ApplyMode,
+} from "../lib/costHistory.server";
+import { todayString } from "../lib/dates";
+import { parseAmount, round2 } from "../lib/money";
+import { PriceChangeModal } from "../components/PriceChangeModal";
 
 const BUILT_IN_UNITS = ["piece", "cm", "meter", "gram", "kg", "ml", "liter", "roll", "sheet"];
 
@@ -67,6 +75,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     customUnits,
     units,
     currency: settings.currency,
+    today: todayString(),
     ordersReadable: usage.size >= 0,
   };
 };
@@ -80,17 +89,43 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "create" || intent === "update") {
     const name = String(form.get("name") ?? "").trim();
     if (!name) return { error: "Name is required." };
-    const data = {
-      name,
-      unit: String(form.get("unit") ?? "piece"),
-      costPerUnit: parseAmount(form.get("costPerUnit")),
-    };
+    const costPerUnit = parseAmount(form.get("costPerUnit"));
+    const data = { name, unit: String(form.get("unit") ?? "piece"), costPerUnit };
+
     if (intent === "create") {
-      await prisma.material.create({
+      const created = await prisma.material.create({
         data: { shop, ...data, stock: parseAmount(form.get("stock")) },
       });
-    } else {
-      await prisma.material.updateMany({ where: { id: String(form.get("id")), shop }, data });
+      // A brand new material has always cost this, as far as the shop knows.
+      await recordMaterialPrice({
+        shop,
+        materialId: created.id,
+        costPerUnit,
+        mode: "date",
+        chosenDay: EARLIEST_DAY,
+      });
+      return { ok: true };
+    }
+
+    const id = String(form.get("id"));
+    const existing = await prisma.material.findFirst({ where: { id, shop } });
+    if (!existing) return { error: "Material not found." };
+
+    // Seed BEFORE the update: seeding records the material's current cost as
+    // its historical baseline, so it has to happen while that value is still
+    // the old one.
+    await seedCostHistory(shop);
+
+    await prisma.material.updateMany({ where: { id, shop }, data });
+
+    if (costPerUnit !== existing.costPerUnit) {
+      await recordMaterialPrice({
+        shop,
+        materialId: id,
+        costPerUnit,
+        mode: (String(form.get("applyMode") ?? "today") as ApplyMode),
+        chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+      });
     }
     return { ok: true };
   }
@@ -285,23 +320,43 @@ function MaterialRow({
   index,
   units,
   currency,
+  today,
   onRestock,
 }: {
   material: MaterialItem;
   index: number;
   units: string[];
   currency: string;
+  today: string;
   onRestock: (m: MaterialItem) => void;
 }) {
   const fetcher = useFetcher<typeof action>();
   const [name, setName] = useState(material.name);
   const [unit, setUnit] = useState(material.unit);
   const [cost, setCost] = useState(String(material.costPerUnit));
+  const [askWhen, setAskWhen] = useState(false);
   const busy = fetcher.state !== "idle";
+  const priceChanged = parseFloat(cost || "0") !== material.costPerUnit;
   const dirty =
     name !== material.name || unit !== material.unit || cost !== String(material.costPerUnit);
   const unitOptions = units.map((u) => ({ label: u, value: u }));
   if (!units.includes(unit)) unitOptions.unshift({ label: unit, value: unit });
+
+  const save = (applyMode: string, applyDay: string) => {
+    fetcher.submit(
+      {
+        _action: "update",
+        id: material.id,
+        name,
+        unit,
+        costPerUnit: cost || "0",
+        applyMode,
+        applyDay,
+      },
+      { method: "post" },
+    );
+    setAskWhen(false);
+  };
 
   return (
     <IndexTable.Row id={material.id} position={index}>
@@ -349,12 +404,12 @@ function MaterialRow({
             size="slim"
             disabled={!dirty}
             loading={busy}
-            onClick={() =>
-              fetcher.submit(
-                { _action: "update", id: material.id, name, unit, costPerUnit: cost || "0" },
-                { method: "post" },
-              )
-            }
+            onClick={() => {
+              // Only interrupt when the money actually moved; renaming a
+              // material has no effect on any past report.
+              if (priceChanged) setAskWhen(true);
+              else save("today", today);
+            }}
           >
             Save
           </Button>
@@ -374,13 +429,25 @@ function MaterialRow({
             Delete
           </Button>
         </InlineStack>
+        {askWhen && (
+          <PriceChangeModal
+            open
+            itemName={material.name}
+            oldValue={material.costPerUnit}
+            newValue={parseFloat(cost || "0")}
+            currency={currency}
+            today={today}
+            onCancel={() => setAskWhen(false)}
+            onConfirm={save}
+          />
+        )}
       </IndexTable.Cell>
     </IndexTable.Row>
   );
 }
 
 export default function MaterialsPage() {
-  const { materials, customUnits, units, currency } = useLoaderData<typeof loader>();
+  const { materials, customUnits, units, currency, today } = useLoaderData<typeof loader>();
   const restockFetcher = useFetcher<typeof action>();
 
   const [restock, setRestock] = useState<MaterialItem | null>(null);
@@ -444,6 +511,7 @@ export default function MaterialsPage() {
                   index={i}
                   units={units}
                   currency={currency}
+                  today={today}
                   onRestock={openRestock}
                 />
               ))}

@@ -12,6 +12,9 @@ import prisma from "../db.server";
 import { getSettings, type ShopSettings } from "./settings.server";
 import { round2 } from "./money";
 import { daysInclusive, todayString, daysAgoString } from "./dates";
+import { loadCostTimeline, type CostMap, type ProductUnitCost, type Zone } from "./costHistory.server";
+
+export type { CostMap, ProductUnitCost, Zone };
 
 /** Minimal shape of the Admin GraphQL client we rely on (version-agnostic). */
 type GraphqlClient = {
@@ -47,19 +50,6 @@ export type NormalizedOrder = {
   province: string | null;
   country: string | null;
   lineItems: NormalizedLineItem[];
-};
-
-/** Per-unit cost of a product, derived from its bill of materials + other cost. */
-export type ProductUnitCost = {
-  productId: string;
-  title: string;
-  materialCost: number;
-  returnMaterialUnitCost: number;
-  factoryCost: number;
-  otherCost: number;
-  unitCost: number;
-  returnDeliveryMode: string;
-  returnDeliveryPercent: number;
 };
 
 export type OrderOverride = {
@@ -159,51 +149,21 @@ export type Report = {
 // Product cost map
 // ---------------------------------------------------------------------------
 
-export type CostMap = Map<string, ProductUnitCost>;
-
-/** Load every costed product for a shop and index it by Shopify product GID. */
-export async function loadCostMap(shop: string): Promise<CostMap> {
-  const rows = await prisma.productCost.findMany({
-    where: { shop },
-    include: { bomLines: { include: { material: true } } },
-  });
-  const map: CostMap = new Map();
-  for (const row of rows) {
-    const materialCost = row.bomLines.reduce(
-      (sum, line) => sum + line.quantity * line.material.costPerUnit,
-      0,
-    );
-    const returnMaterialCost = row.bomLines.reduce(
-      (sum, line) =>
-        sum + (line.countOnReturn ? line.quantity * line.material.costPerUnit : 0),
-      0,
-    );
-    map.set(row.productId, {
-      productId: row.productId,
-      title: row.title,
-      materialCost: round2(materialCost),
-      returnMaterialUnitCost: round2(returnMaterialCost),
-      factoryCost: round2(row.factoryCost),
-      otherCost: round2(row.otherCost),
-      unitCost: round2(materialCost + row.factoryCost + row.otherCost),
-      returnDeliveryMode: row.returnDeliveryMode,
-      returnDeliveryPercent: row.returnDeliveryPercent,
-    });
-  }
-  return map;
+/**
+ * Product costs as they stand TODAY.
+ *
+ * Only for screens that edit or preview current costs. Reports must never use
+ * this — they resolve each order against the costs that applied on its own
+ * date, via loadCostTimeline. See app/lib/costHistory.server.ts.
+ */
+export async function loadCurrentCostMap(shop: string): Promise<CostMap> {
+  const timeline = await loadCostTimeline(shop);
+  return timeline.costMapAt(todayString());
 }
 
 // ---------------------------------------------------------------------------
 // Delivery zone matching
 // ---------------------------------------------------------------------------
-
-export type Zone = {
-  id: string;
-  name: string;
-  keywords: string;
-  realCost: number;
-  isDefault: boolean;
-};
 
 function normalizeText(value: string): string {
   return value
@@ -619,10 +579,9 @@ export async function buildReport(
   startDay: string,
   endDay: string,
 ): Promise<Report> {
-  const [costMap, zoneRows, settings, overrideRows, adRows, expenseRows, workerRows, paymentRows, fetched] =
+  const [timeline, settings, overrideRows, adRows, expenseRows, workerRows, paymentRows, fetched] =
     await Promise.all([
-      loadCostMap(shop),
-      prisma.deliveryZone.findMany({ where: { shop } }),
+      loadCostTimeline(shop),
       getSettings(shop),
       prisma.orderCost.findMany({ where: { shop } }),
       prisma.adSpend.findMany({
@@ -636,13 +595,6 @@ export async function buildReport(
       fetchOrders(admin, startDay, endDay),
     ]);
 
-  const zones: Zone[] = zoneRows.map((z) => ({
-    id: z.id,
-    name: z.name,
-    keywords: z.keywords,
-    realCost: z.realCost,
-    isDefault: z.isDefault,
-  }));
   const overrideMap = new Map(
     overrideRows.map((o) => [
       o.orderId,
@@ -657,8 +609,17 @@ export async function buildReport(
     ]),
   );
 
+  // Each order is priced with the costs that applied on the day it was placed,
+  // so a price change today cannot move yesterday's profit.
+  const dayOf = (order: NormalizedOrder) => order.createdAt.slice(0, 10);
+
   const orders = fetched.orders.map((o) =>
-    computeOrderPnl(o, { costMap, zones, settings, override: overrideMap.get(o.id) }),
+    computeOrderPnl(o, {
+      costMap: timeline.costMapAt(dayOf(o)),
+      zones: timeline.zonesAt(dayOf(o)),
+      settings,
+      override: overrideMap.get(o.id),
+    }),
   );
   const orderPnlMap = new Map(orders.map((o) => [o.orderId, o]));
 
@@ -672,10 +633,11 @@ export async function buildReport(
 
     const totalLineRevenue = order.lineItems.reduce((sum, line) => sum + line.revenue, 0);
     const totalQty = order.lineItems.reduce((sum, line) => sum + line.quantity, 0);
+    const orderCostMap = timeline.costMapAt(dayOf(order));
 
     for (const line of order.lineItems) {
       const key = line.productId ?? `title:${line.title}`;
-      const cost = line.productId ? costMap.get(line.productId) : undefined;
+      const cost = line.productId ? orderCostMap.get(line.productId) : undefined;
       const shareByRevenue = totalLineRevenue > 0 ? line.revenue / totalLineRevenue : 0;
       const shareByQty = totalQty > 0 ? line.quantity / totalQty : 0;
       const allocationShare = shareByRevenue > 0 ? shareByRevenue : shareByQty;

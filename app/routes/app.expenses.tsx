@@ -10,7 +10,6 @@ import {
   TextField,
   Select,
   Button,
-  Checkbox,
   IndexTable,
   Badge,
   Banner,

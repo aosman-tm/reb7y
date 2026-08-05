@@ -17,7 +17,7 @@ import {
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
-import { loadCostMap } from "../lib/profit.server";
+import { loadCurrentCostMap } from "../lib/profit.server";
 import { getSettings } from "../lib/settings.server";
 import { formatMoney, round2 } from "../lib/money";
 
@@ -47,7 +47,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     variables: { first: 100, query: q ? `title:*${q}*` : null },
   });
   const body: any = await response.json();
-  const costMap = await loadCostMap(session.shop);
+  const costMap = await loadCurrentCostMap(session.shop);
   const settings = await getSettings(session.shop);
 
   const products = ((body?.data?.products?.edges ?? []) as any[]).map((edge: any) => {

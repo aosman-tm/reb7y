@@ -23,6 +23,20 @@ import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
 import { parseAmount } from "../lib/money";
 import { fetchShopifyDeliveryZones, type ShopifyZonePreset } from "../lib/shipping.server";
+import {
+  recordZonePrice,
+  seedCostHistory,
+  EARLIEST_DAY,
+  type ApplyMode,
+} from "../lib/costHistory.server";
+import { todayString } from "../lib/dates";
+import { PriceChangeModal } from "../components/PriceChangeModal";
+
+/** Which of the three "apply from" choices the merchant picked. */
+function applyModeFrom(form: FormData): ApplyMode {
+  const raw = String(form.get("applyMode") ?? "today");
+  return raw === "date" || raw === "correct" ? raw : "today";
+}
 
 // Fallback zones for Egypt, used only when Shopify's own shipping zones can't be
 // read (missing `read_shipping` scope, or none configured yet). Keywords match
@@ -133,6 +147,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return {
     zones,
     currency: settings.currency,
+    today: todayString(),
     shopifyZones: shopifyZonesResult.zones,
     shopifyZonesError: shopifyZonesResult.error,
   };
@@ -174,10 +189,30 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (intent === "create") {
       const created = await prisma.deliveryZone.create({ data: { shop, ...data } });
       if (isDefault) await clearOtherDefaults(shop, created.id);
+      // A brand new zone has always cost this, as far as the shop knows.
+      await recordZonePrice({
+        shop,
+        zoneId: created.id,
+        realCost: data.realCost,
+        mode: "date",
+        chosenDay: EARLIEST_DAY,
+      });
     } else {
       const id = String(form.get("id"));
+      const existing = await prisma.deliveryZone.findFirst({ where: { id, shop } });
+      // Seed before the update, while the old cost is still the current value.
+      await seedCostHistory(shop);
       await prisma.deliveryZone.updateMany({ where: { id, shop }, data });
       if (isDefault) await clearOtherDefaults(shop, id);
+      if (existing && existing.realCost !== data.realCost) {
+        await recordZonePrice({
+          shop,
+          zoneId: id,
+          realCost: data.realCost,
+          mode: applyModeFrom(form),
+          chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+        });
+      }
     }
     return { ok: true };
   }
@@ -195,11 +230,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const existing = await prisma.deliveryZone.findFirst({ where: { shop, name } });
     if (existing) {
+      // Seed before the update, while the old cost is still the current value.
+      await seedCostHistory(shop);
       await prisma.deliveryZone.update({ where: { id: existing.id }, data });
       if (isDefault) await clearOtherDefaults(shop, existing.id);
+      if (existing.realCost !== data.realCost) {
+        await recordZonePrice({
+          shop,
+          zoneId: existing.id,
+          realCost: data.realCost,
+          mode: applyModeFrom(form),
+          chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+        });
+      }
     } else {
       const created = await prisma.deliveryZone.create({ data: { shop, ...data } });
       if (isDefault) await clearOtherDefaults(shop, created.id);
+      await recordZonePrice({
+        shop,
+        zoneId: created.id,
+        realCost: data.realCost,
+        mode: "date",
+        chosenDay: EARLIEST_DAY,
+      });
     }
     return { ok: true };
   }
@@ -317,12 +370,41 @@ function AddZone({
   );
 }
 
-function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currency: string }) {
+function ZoneRow({
+  zone,
+  index,
+  currency,
+  today,
+}: {
+  zone: Zone;
+  index: number;
+  currency: string;
+  today: string;
+}) {
   const fetcher = useFetcher<typeof action>();
   const [cost, setCost] = useState(String(zone.realCost));
   const [isDefault, setIsDefault] = useState(zone.isDefault);
+  const [askWhen, setAskWhen] = useState(false);
   const busy = fetcher.state !== "idle";
   const dirty = cost !== String(zone.realCost) || isDefault !== zone.isDefault;
+  const priceChanged = parseFloat(cost || "0") !== zone.realCost;
+
+  const save = (applyMode: string, applyDay: string) => {
+    fetcher.submit(
+      {
+        _action: "update",
+        id: zone.id,
+        name: zone.name,
+        keywords: zone.keywords,
+        realCost: cost || "0",
+        isDefault: String(isDefault),
+        applyMode,
+        applyDay,
+      },
+      { method: "post" },
+    );
+    setAskWhen(false);
+  };
 
   return (
     <IndexTable.Row id={zone.id} position={index}>
@@ -356,19 +438,12 @@ function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currenc
             size="slim"
             disabled={!dirty}
             loading={busy}
-            onClick={() =>
-              fetcher.submit(
-                {
-                  _action: "update",
-                  id: zone.id,
-                  name: zone.name,
-                  keywords: zone.keywords,
-                  realCost: cost || "0",
-                  isDefault: String(isDefault),
-                },
-                { method: "post" },
-              )
-            }
+            onClick={() => {
+              // Only interrupt when the cost moved; toggling "default" changes
+              // no past order's money.
+              if (priceChanged) setAskWhen(true);
+              else save("today", today);
+            }}
           >
             Save
           </Button>
@@ -385,13 +460,25 @@ function ZoneRow({ zone, index, currency }: { zone: Zone; index: number; currenc
             Delete
           </Button>
         </InlineStack>
+        {askWhen && (
+          <PriceChangeModal
+            open
+            itemName={`delivery to ${zone.name}`}
+            oldValue={zone.realCost}
+            newValue={parseFloat(cost || "0")}
+            currency={currency}
+            today={today}
+            onCancel={() => setAskWhen(false)}
+            onConfirm={save}
+          />
+        )}
       </IndexTable.Cell>
     </IndexTable.Row>
   );
 }
 
 export default function DeliveryPage() {
-  const { zones, currency, shopifyZones, shopifyZonesError } = useLoaderData<typeof loader>();
+  const { zones, currency, shopifyZones, shopifyZonesError, today } = useLoaderData<typeof loader>();
   const usingLiveZones = shopifyZones.length > 0;
 
   return (
@@ -445,7 +532,7 @@ export default function DeliveryPage() {
               ]}
             >
               {zones.map((z, i) => (
-                <ZoneRow key={z.id} zone={z} index={i} currency={currency} />
+                <ZoneRow key={z.id} zone={z} index={i} currency={currency} today={today} />
               ))}
             </IndexTable>
           )}
