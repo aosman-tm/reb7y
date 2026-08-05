@@ -1,0 +1,15 @@
+# Caddy obtains and renews a free Let's Encrypt certificate automatically.
+162-35-184-237.sslip.io {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:3000 {
+		header_up X-Forwarded-Proto https
+	}
+
+	log {
+		output file /var/log/caddy/reb7y.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

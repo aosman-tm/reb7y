@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Files executed on the Linux server must always keep LF endings.
+*.sh text eol=lf
+deploy/Caddyfile text eol=lf
+deploy/*.service text eol=lf

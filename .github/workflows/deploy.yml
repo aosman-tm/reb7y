@@ -1,0 +1,47 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deploys at once; queue them instead of cancelling,
+# so a deploy is never interrupted half-way through a migration.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  VPS_HOST: 162.35.184.237
+  VPS_USER: deploy
+
+jobs:
+  deploy:
+    name: Build and restart on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Host key pinned so we are not trusting whatever answers on first connect.
+          printf '%s\n' '162.35.184.237 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOsXOQA1Z+Mj8h7Oz7P8OyrL0dq1UQKHWRBRqx+mdiYb' > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Pull latest code and deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" \
+            'set -euo pipefail
+             cd /srv/reb7y/app
+             git fetch --prune origin
+             git reset --hard origin/main
+             git clean -fd
+             bash deploy/deploy.sh'
+
+      - name: Clean up key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
