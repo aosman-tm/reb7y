@@ -243,7 +243,7 @@ function AddZone({
     <Card>
       <BlockStack gap="300">
         <Text as="h2" variant="headingMd">
-          Add a delivery zone
+          Add a delivery zonee
         </Text>
         <InlineGrid columns={{ xs: 1, sm: "2fr 1fr auto" }} gap="300">
           <Select
