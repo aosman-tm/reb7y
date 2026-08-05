@@ -26,17 +26,13 @@ import { fetchShopifyDeliveryZones, type ShopifyZonePreset } from "../lib/shippi
 import {
   recordZonePrice,
   seedCostHistory,
+  priceChangeFromForm,
+  allZoneHistories,
   EARLIEST_DAY,
-  type ApplyMode,
 } from "../lib/costHistory.server";
 import { todayString } from "../lib/dates";
+import type { PriceEntry } from "../lib/priceTimeline";
 import { PriceChangeModal } from "../components/PriceChangeModal";
-
-/** Which of the three "apply from" choices the merchant picked. */
-function applyModeFrom(form: FormData): ApplyMode {
-  const raw = String(form.get("applyMode") ?? "today");
-  return raw === "date" || raw === "correct" ? raw : "today";
-}
 
 // Fallback zones for Egypt, used only when Shopify's own shipping zones can't be
 // read (missing `read_shipping` scope, or none configured yet). Keywords match
@@ -72,6 +68,8 @@ type Zone = {
   realCost: number;
   isDefault: boolean;
 };
+
+type ZoneWithHistory = Zone & { history: PriceEntry[] };
 
 type ZonePreset = {
   key: string;
@@ -136,16 +134,21 @@ function buildZonePresets(zones: Zone[], shopifyZones: ShopifyZonePreset[]): Zon
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [zones, settings, shopifyZonesResult] = await Promise.all([
+  const [zones, settings, shopifyZonesResult, histories] = await Promise.all([
     prisma.deliveryZone.findMany({
       where: { shop: session.shop },
       orderBy: [{ isDefault: "desc" }, { name: "asc" }],
     }),
     getSettings(session.shop),
     fetchShopifyDeliveryZones(admin),
+    allZoneHistories(session.shop),
   ]);
   return {
-    zones,
+    zones: zones.map((z) => ({
+      ...z,
+      // Past costs, so the edit screen can preview the result of a change.
+      history: histories[z.id] ?? [{ effectiveFrom: EARLIEST_DAY, amount: z.realCost }],
+    })),
     currency: settings.currency,
     today: todayString(),
     shopifyZones: shopifyZonesResult.zones,
@@ -193,9 +196,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await recordZonePrice({
         shop,
         zoneId: created.id,
-        realCost: data.realCost,
-        mode: "date",
-        chosenDay: EARLIEST_DAY,
+        change: { mode: "date", amount: data.realCost, from: EARLIEST_DAY },
       });
     } else {
       const id = String(form.get("id"));
@@ -208,9 +209,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await recordZonePrice({
           shop,
           zoneId: id,
-          realCost: data.realCost,
-          mode: applyModeFrom(form),
-          chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+          change: priceChangeFromForm(form, data.realCost),
         });
       }
     }
@@ -238,9 +237,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await recordZonePrice({
           shop,
           zoneId: existing.id,
-          realCost: data.realCost,
-          mode: applyModeFrom(form),
-          chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+          change: priceChangeFromForm(form, data.realCost),
         });
       }
     } else {
@@ -249,9 +246,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await recordZonePrice({
         shop,
         zoneId: created.id,
-        realCost: data.realCost,
-        mode: "date",
-        chosenDay: EARLIEST_DAY,
+        change: { mode: "date", amount: data.realCost, from: EARLIEST_DAY },
       });
     }
     return { ok: true };
@@ -376,7 +371,7 @@ function ZoneRow({
   currency,
   today,
 }: {
-  zone: Zone;
+  zone: ZoneWithHistory;
   index: number;
   currency: string;
   today: string;
@@ -389,7 +384,7 @@ function ZoneRow({
   const dirty = cost !== String(zone.realCost) || isDefault !== zone.isDefault;
   const priceChanged = parseFloat(cost || "0") !== zone.realCost;
 
-  const save = (applyMode: string, applyDay: string) => {
+  const save = (applyMode: string, applyFrom: string, applyTo: string) => {
     fetcher.submit(
       {
         _action: "update",
@@ -399,7 +394,8 @@ function ZoneRow({
         realCost: cost || "0",
         isDefault: String(isDefault),
         applyMode,
-        applyDay,
+        applyFrom,
+        applyTo,
       },
       { method: "post" },
     );
@@ -442,7 +438,7 @@ function ZoneRow({
               // Only interrupt when the cost moved; toggling "default" changes
               // no past order's money.
               if (priceChanged) setAskWhen(true);
-              else save("today", today);
+              else save("today", today, today);
             }}
           >
             Save
@@ -468,6 +464,7 @@ function ZoneRow({
             newValue={parseFloat(cost || "0")}
             currency={currency}
             today={today}
+            history={zone.history}
             onCancel={() => setAskWhen(false)}
             onConfirm={save}
           />

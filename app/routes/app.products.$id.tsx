@@ -26,8 +26,10 @@ import { parseAmount, formatMoney, round2 } from "../lib/money";
 import {
   recordProductCostChange,
   seedCostHistory,
-  type ApplyMode,
+  priceChangeFromForm,
+  productExtrasHistory,
 } from "../lib/costHistory.server";
+import type { PriceChange, PriceEntry } from "../lib/priceTimeline";
 import { todayString } from "../lib/dates";
 import { PriceChangeModal } from "../components/PriceChangeModal";
 
@@ -45,7 +47,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const gid = `gid://shopify/Product/${params.id}`;
 
-  const [productResp, productCost, materials, settings] = await Promise.all([
+  const [productResp, productCost, materials, settings, extrasHistory] = await Promise.all([
     admin.graphql(PRODUCT_QUERY, { variables: { id: gid } }),
     prisma.productCost.findUnique({
       where: { shop_productId: { shop: session.shop, productId: gid } },
@@ -56,6 +58,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       orderBy: { name: "asc" },
     }),
     getSettings(session.shop),
+    productExtrasHistory(session.shop, gid),
   ]);
 
   const body: any = await productResp.json();
@@ -97,6 +100,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     margin: round2(price - unitCost),
     currency: settings.currency,
     today: todayString(),
+    // Past factory+other costs, so the edit screen can preview a change.
+    extrasHistory: extrasHistory.length
+      ? extrasHistory
+      : ([{ effectiveFrom: "2000-01-01", amount: round2(factoryCost + otherCost) }] as PriceEntry[]),
     returnDeliveryMode: productCost?.returnDeliveryMode ?? "settings",
     returnDeliveryPercent: round2(productCost?.returnDeliveryPercent ?? 100),
     settingsReturnDeliveryMode: settings.returnDeliveryMode,
@@ -129,18 +136,20 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
    */
   const withHistory = async (
     mutate: () => Promise<void>,
-    opts: { mode: ApplyMode; chosenDay?: string | null; reason: string },
+    opts: { change: PriceChange; reason: string },
   ) => {
     await seedCostHistory(shop);
     await mutate();
     await recordProductCostChange({
       shop,
       productId: gid,
-      mode: opts.mode,
-      chosenDay: opts.chosenDay,
+      change: opts.change,
       reason: opts.reason,
     });
   };
+
+  /** Recipe edits always count from today; only money amounts ask when. */
+  const fromToday = (): PriceChange => ({ mode: "today", amount: 0, today: todayString() });
 
   if (intent === "addLine") {
     const materialId = String(form.get("materialId") ?? "");
@@ -156,7 +165,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           },
         });
       },
-      { mode: "today", reason: "recipe" },
+      { change: fromToday(), reason: "recipe" },
     );
     return { ok: true };
   }
@@ -164,8 +173,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (intent === "saveExtras") {
     const returnDeliveryMode = String(form.get("returnDeliveryMode") ?? "settings");
     const returnDeliveryPercent = parseAmount(form.get("returnDeliveryPercent"), 100);
-    const raw = String(form.get("applyMode") ?? "today");
-    const mode: ApplyMode = raw === "date" || raw === "correct" ? raw : "today";
+    const newExtras =
+      parseAmount(form.get("factoryCost")) + parseAmount(form.get("otherCost"));
     await withHistory(
       async () => {
         await prisma.productCost.upsert({
@@ -187,11 +196,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           },
         });
       },
-      {
-        mode,
-        chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
-        reason: "edit",
-      },
+      { change: priceChangeFromForm(form, newExtras), reason: "edit" },
     );
     return { ok: true };
   }
@@ -215,7 +220,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           await prisma.bomLine.delete({ where: { id: lineId } });
         }
       },
-      { mode: "today", reason: "recipe" },
+      { change: fromToday(), reason: "recipe" },
     );
     return { ok: true };
   }
@@ -234,7 +239,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           data: { countOnReturn: form.get("countOnReturn") === "true" },
         });
       },
-      { mode: "today", reason: "recipe" },
+      { change: fromToday(), reason: "recipe" },
     );
     return { ok: true };
   }
@@ -363,7 +368,7 @@ export default function ProductCostEditor() {
   const newExtras = round2(parseFloat(factory || "0") + parseFloat(other || "0"));
   const extrasChanged = newExtras !== oldExtras;
 
-  const saveExtras = (applyMode: string, applyDay: string) => {
+  const saveExtras = (applyMode: string, applyFrom: string, applyTo: string) => {
     otherFetcher.submit(
       {
         _action: "saveExtras",
@@ -373,7 +378,8 @@ export default function ProductCostEditor() {
         returnDeliveryPercent: returnDeliveryPercent || "100",
         title: data.product.title,
         applyMode,
-        applyDay,
+        applyFrom,
+        applyTo,
       },
       { method: "post" },
     );
@@ -590,7 +596,7 @@ export default function ProductCostEditor() {
                     // Only interrupt when the money changed; the return-delivery
                     // rule alone does not restate what a past order cost to make.
                     if (extrasChanged) setAskWhen(true);
-                    else saveExtras("today", data.today);
+                    else saveExtras("today", data.today, data.today);
                   }}
                 >
                   Save
@@ -647,6 +653,7 @@ export default function ProductCostEditor() {
           newValue={newExtras}
           currency={currency}
           today={data.today}
+          history={data.extrasHistory}
           onCancel={() => setAskWhen(false)}
           onConfirm={saveExtras}
         />

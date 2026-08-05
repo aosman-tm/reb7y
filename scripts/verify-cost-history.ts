@@ -11,9 +11,12 @@ import {
   resolveAsOf,
   EARLIEST_DAY,
 } from "../app/lib/costHistory.server";
+import { applyPriceChange, toPeriods, describePeriod } from "../app/lib/priceTimeline";
+import { todayString } from "../app/lib/dates";
 
 const SHOP = "verify-cost-history.myshopify.test";
 const PRODUCT = "gid://shopify/Product/VERIFY1";
+const TODAY = todayString();
 
 let failures = 0;
 function check(name: string, actual: unknown, expected: unknown) {
@@ -47,6 +50,31 @@ async function main() {
   check("picks the newest on an exact date", resolveAsOf(rows, "2026-08-01")?.v, 30);
   check("dates before all entries fall back to oldest", resolveAsOf(rows, "2025-01-01")?.v, 10);
 
+  // --- What the preview shows is what gets stored ---------------------------
+  const base = [{ effectiveFrom: EARLIEST_DAY, amount: 15 }];
+  const periods = toPeriods(
+    applyPriceChange(base, { mode: "range", amount: 25, from: "2026-03-01", to: "2026-03-31" }),
+  );
+  check("a period produces three stretches of time", periods.length, 3);
+  check("the first stretch keeps the old price", periods[0].amount, 15);
+  check("the middle stretch is the new price", periods[1].amount, 25);
+  check("the last stretch returns to the old price", periods[2].amount, 15);
+  check("the period reads plainly", describePeriod(periods[1], EARLIEST_DAY), "1 Mar 2026 – 31 Mar 2026");
+  check("the open-ended tail reads plainly", describePeriod(periods[2], EARLIEST_DAY), "From 1 Apr 2026 onward");
+  check(
+    "a period inside another replaces it",
+    toPeriods(
+      applyPriceChange(
+        [
+          { effectiveFrom: EARLIEST_DAY, amount: 15 },
+          { effectiveFrom: "2026-03-10", amount: 40 },
+        ],
+        { mode: "range", amount: 25, from: "2026-03-01", to: "2026-03-31" },
+      ),
+    ).length,
+    3,
+  );
+
   // --- The box scenario ------------------------------------------------------
   // A box costing 15 EGP, used one per product.
   const box = await prisma.material.create({
@@ -67,9 +95,7 @@ async function main() {
   await recordMaterialPrice({
     shop: SHOP,
     materialId: box.id,
-    costPerUnit: 17,
-    mode: "date",
-    chosenDay: "2026-08-01",
+    change: { mode: "date", amount: 17, from: "2026-08-01" },
   });
 
   const timeline = await loadCostTimeline(SHOP);
@@ -85,8 +111,7 @@ async function main() {
   await recordMaterialPrice({
     shop: SHOP,
     materialId: box.id,
-    costPerUnit: 16,
-    mode: "correct",
+    change: { mode: "correct", amount: 16, today: TODAY },
   });
   const afterFix = await loadCostTimeline(SHOP);
   check(
@@ -100,6 +125,34 @@ async function main() {
     15,
   );
 
+  // --- A price that applied only for a period --------------------------------
+  // Reset to a clean single price, then say the box cost 25 EGP only during
+  // March 2026 (a temporary supplier) and went back afterwards.
+  await recordMaterialPrice({
+    shop: SHOP,
+    materialId: box.id,
+    change: { mode: "correct", amount: 15, today: TODAY },
+  });
+  await prisma.materialPrice.deleteMany({
+    where: { shop: SHOP, materialId: box.id, effectiveFrom: { gt: EARLIEST_DAY } },
+  });
+  await recordMaterialPrice({
+    shop: SHOP,
+    materialId: box.id,
+    change: { mode: "range", amount: 25, from: "2026-03-01", to: "2026-03-31" },
+  });
+
+  const ranged = await loadCostTimeline(SHOP);
+  check("before the period: old price", ranged.costMapAt("2026-02-28").get(PRODUCT)?.materialCost, 15);
+  check("first day of the period: new price", ranged.costMapAt("2026-03-01").get(PRODUCT)?.materialCost, 25);
+  check("inside the period: new price", ranged.costMapAt("2026-03-15").get(PRODUCT)?.materialCost, 25);
+  check("last day of the period: new price", ranged.costMapAt("2026-03-31").get(PRODUCT)?.materialCost, 25);
+  check("day after the period: back to old", ranged.costMapAt("2026-04-01").get(PRODUCT)?.materialCost, 15);
+  check("long after the period: still old", ranged.costMapAt("2026-08-05").get(PRODUCT)?.materialCost, 15);
+
+  const liveAfterRange = await prisma.material.findUnique({ where: { id: box.id } });
+  check("a past-only period leaves today's price alone", liveAfterRange?.costPerUnit, 15);
+
   // --- Delivery zones behave the same way ------------------------------------
   const zone = await prisma.deliveryZone.create({
     data: { shop: SHOP, name: "Cairo", keywords: "cairo", realCost: 50, isDefault: true },
@@ -109,9 +162,7 @@ async function main() {
   await recordZonePrice({
     shop: SHOP,
     zoneId: zone.id,
-    realCost: 65,
-    mode: "date",
-    chosenDay: "2026-08-01",
+    change: { mode: "date", amount: 65, from: "2026-08-01" },
   });
 
   const zoneTimeline = await loadCostTimeline(SHOP);

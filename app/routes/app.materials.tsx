@@ -26,8 +26,9 @@ import { computeMaterialUsage } from "../lib/profit.server";
 import {
   recordMaterialPrice,
   seedCostHistory,
+  priceChangeFromForm,
+  allMaterialHistories,
   EARLIEST_DAY,
-  type ApplyMode,
 } from "../lib/costHistory.server";
 import { todayString } from "../lib/dates";
 import { parseAmount, round2 } from "../lib/money";
@@ -38,10 +39,11 @@ const BUILT_IN_UNITS = ["piece", "cm", "meter", "gram", "kg", "ml", "liter", "ro
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
-  const [materials, settings, customUnits] = await Promise.all([
+  const [materials, settings, customUnits, histories] = await Promise.all([
     prisma.material.findMany({ where: { shop, archived: false }, orderBy: { name: "asc" } }),
     getSettings(shop),
     prisma.customUnit.findMany({ where: { shop }, orderBy: { name: "asc" } }),
+    allMaterialHistories(shop),
   ]);
 
   // Consumption from delivered orders (last 12 months). Fails quietly if the
@@ -66,6 +68,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       used,
       remaining,
       low: m.lowStockThreshold > 0 && remaining <= m.lowStockThreshold,
+      // Past prices, so the edit screen can preview the result of a change.
+      history: histories[m.id] ?? [{ effectiveFrom: EARLIEST_DAY, amount: m.costPerUnit }],
     };
   });
 
@@ -100,9 +104,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await recordMaterialPrice({
         shop,
         materialId: created.id,
-        costPerUnit,
-        mode: "date",
-        chosenDay: EARLIEST_DAY,
+        change: { mode: "date", amount: costPerUnit, from: EARLIEST_DAY },
       });
       return { ok: true };
     }
@@ -122,9 +124,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await recordMaterialPrice({
         shop,
         materialId: id,
-        costPerUnit,
-        mode: (String(form.get("applyMode") ?? "today") as ApplyMode),
-        chosenDay: form.get("applyDay") ? String(form.get("applyDay")) : null,
+        change: priceChangeFromForm(form, costPerUnit),
       });
     }
     return { ok: true };
@@ -313,6 +313,7 @@ type MaterialItem = {
   used: number;
   remaining: number;
   low: boolean;
+  history: { effectiveFrom: string; amount: number }[];
 };
 
 function MaterialRow({
@@ -342,7 +343,7 @@ function MaterialRow({
   const unitOptions = units.map((u) => ({ label: u, value: u }));
   if (!units.includes(unit)) unitOptions.unshift({ label: unit, value: unit });
 
-  const save = (applyMode: string, applyDay: string) => {
+  const save = (applyMode: string, applyFrom: string, applyTo: string) => {
     fetcher.submit(
       {
         _action: "update",
@@ -351,7 +352,8 @@ function MaterialRow({
         unit,
         costPerUnit: cost || "0",
         applyMode,
-        applyDay,
+        applyFrom,
+        applyTo,
       },
       { method: "post" },
     );
@@ -408,7 +410,7 @@ function MaterialRow({
               // Only interrupt when the money actually moved; renaming a
               // material has no effect on any past report.
               if (priceChanged) setAskWhen(true);
-              else save("today", today);
+              else save("today", today, today);
             }}
           >
             Save
@@ -437,6 +439,7 @@ function MaterialRow({
             newValue={parseFloat(cost || "0")}
             currency={currency}
             today={today}
+            history={material.history}
             onCancel={() => setAskWhen(false)}
             onConfirm={save}
           />
