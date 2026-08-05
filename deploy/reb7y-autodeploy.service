@@ -1,0 +1,16 @@
+[Unit]
+Description=Deploy reb7y when origin/main has new commits
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/srv/reb7y/app
+ExecStart=/srv/reb7y/run-deploy.sh --if-changed
+# A cold npm ci plus a Vite build on 1 CPU can legitimately take a while.
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reb7y-autodeploy

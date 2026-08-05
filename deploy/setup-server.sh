@@ -90,10 +90,16 @@ fi
 chown deploy:deploy "$APP_HOME/.env"
 chmod 600 "$APP_HOME/.env"
 
-echo "############ 8. systemd service ############"
+echo "############ 8. systemd units ############"
 install -m 644 "$APP_DIR/deploy/reb7y.service" /etc/systemd/system/reb7y.service
+# Auto-deploy: polls GitHub every minute. The repo is public, so this needs no
+# credentials on the server and no secret in GitHub.
+install -m 755 -o deploy -g deploy "$APP_DIR/deploy/run-deploy.sh" "$APP_HOME/run-deploy.sh"
+install -m 644 "$APP_DIR/deploy/reb7y-autodeploy.service" /etc/systemd/system/reb7y-autodeploy.service
+install -m 644 "$APP_DIR/deploy/reb7y-autodeploy.timer" /etc/systemd/system/reb7y-autodeploy.timer
 systemctl daemon-reload
 systemctl enable --quiet reb7y
+systemctl enable --quiet --now reb7y-autodeploy.timer
 
 echo "############ 9. Caddy (automatic HTTPS) ############"
 if ! command -v caddy >/dev/null 2>&1; then

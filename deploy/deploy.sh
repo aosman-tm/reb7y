@@ -31,6 +31,12 @@ npx prisma migrate deploy
 echo "==> Building app"
 npm run build
 
+echo "==> Syncing deploy entrypoint"
+# Atomic rename: a currently-running copy keeps its old inode, so refreshing
+# the entrypoint cannot corrupt the script that is executing right now.
+install -m 755 deploy/run-deploy.sh /srv/reb7y/.run-deploy.sh.new
+mv -f /srv/reb7y/.run-deploy.sh.new /srv/reb7y/run-deploy.sh
+
 echo "==> Restarting service"
 sudo systemctl restart reb7y
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check GitHub every minute for new reb7y commits
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=reb7y-autodeploy.service
+
+[Install]
+WantedBy=timers.target

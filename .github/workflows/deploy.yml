@@ -1,12 +1,21 @@
 name: Deploy to VPS
 
+# Deployment happens two ways, and either alone is sufficient:
+#
+#  1. The server polls GitHub every 60s (systemd timer reb7y-autodeploy.timer)
+#     and deploys new commits on main. This needs no secrets and is what runs
+#     by default.
+#  2. This workflow, which pushes the deploy instantly instead of waiting for
+#     the next poll. It activates only once the VPS_SSH_KEY secret exists;
+#     until then it skips cleanly rather than failing.
+#
+# Both call the same flock-protected entrypoint, so they cannot collide.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-# Never run two deploys at once; queue them instead of cancelling,
-# so a deploy is never interrupted half-way through a migration.
 concurrency:
   group: deploy-production
   cancel-in-progress: false
@@ -17,30 +26,41 @@ env:
 
 jobs:
   deploy:
-    name: Build and restart on VPS
+    name: Trigger deploy on VPS
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
-      - name: Configure SSH
+      - name: Check for deploy key
+        id: check
+        env:
+          DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "No VPS_SSH_KEY secret configured."
+            echo "The server's auto-deploy timer will pick this commit up within a minute."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH
+        if: steps.check.outputs.skip == 'false'
+        env:
+          DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           # Host key pinned so we are not trusting whatever answers on first connect.
           printf '%s\n' '162.35.184.237 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOsXOQA1Z+Mj8h7Oz7P8OyrL0dq1UQKHWRBRqx+mdiYb' > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Pull latest code and deploy
+      - name: Deploy
+        if: steps.check.outputs.skip == 'false'
         run: |
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" \
-            'set -euo pipefail
-             cd /srv/reb7y/app
-             git fetch --prune origin
-             git reset --hard origin/main
-             git clean -fd
-             bash deploy/deploy.sh'
+            '/srv/reb7y/run-deploy.sh'
 
       - name: Clean up key
         if: always()
