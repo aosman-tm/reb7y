@@ -1,13 +1,14 @@
 name: Deploy to VPS
 
-# Deployment happens two ways, and either alone is sufficient:
+# Deployment happens two ways, and the first one alone is sufficient:
 #
 #  1. The server polls GitHub every 60s (systemd timer reb7y-autodeploy.timer)
-#     and deploys new commits on main. This needs no secrets and is what runs
-#     by default.
-#  2. This workflow, which pushes the deploy instantly instead of waiting for
-#     the next poll. It activates only once the VPS_SSH_KEY secret exists;
-#     until then it skips cleanly rather than failing.
+#     and deploys new commits on main. No secrets, nothing to maintain. This is
+#     what actually guarantees a push reaches production.
+#  2. This workflow, which pushes the deploy immediately instead of waiting for
+#     the next poll. It is a convenience layer on top of (1): if the deploy key
+#     is missing or unusable it says so and stops, rather than failing the
+#     commit, because the timer is about to deploy the same commit anyway.
 #
 # Both call the same flock-protected entrypoint, so they cannot collide.
 
@@ -31,36 +32,37 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Check for deploy key
+      - name: Check deploy key
         id: check
         env:
           DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+
           if [ -z "$DEPLOY_KEY" ]; then
-            echo "No VPS_SSH_KEY secret configured."
-            echo "The server's auto-deploy timer will pick this commit up within a minute."
+            echo "::notice::No VPS_SSH_KEY secret set. The server's auto-deploy timer will deploy this commit within a minute."
             echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      - name: Configure SSH
-        if: steps.check.outputs.skip == 'false'
-        env:
-          DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          # tr -d '\r': a key copied on Windows arrives with CRLF endings, which
-          # OpenSSH rejects as a malformed key.
+          # tr -d '\r': a key copied on Windows carries CRLF endings, which
+          # OpenSSH rejects as malformed.
           printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+
           if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
-            echo "::error::VPS_SSH_KEY is not a valid OpenSSH private key."
-            echo "Re-copy the whole file, including the BEGIN and END lines:"
-            echo "  cat ~/.ssh/reb7y_deploy"
-            exit 1
+            rm -f ~/.ssh/deploy_key
+            echo "::warning::VPS_SSH_KEY is not a valid OpenSSH private key, so the instant deploy was skipped. This commit still deploys via the server's 60s timer. To fix, replace the secret with the PRIVATE key - the file WITHOUT the .pub extension - including its BEGIN and END lines: cat ~/.ssh/reb7y_deploy"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          # Host key pinned so we are not trusting whatever answers on first connect.
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Pin server host key
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          # Pinned so we are not trusting whatever answers on first connect.
           printf '%s\n' '162.35.184.237 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOsXOQA1Z+Mj8h7Oz7P8OyrL0dq1UQKHWRBRqx+mdiYb' > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
