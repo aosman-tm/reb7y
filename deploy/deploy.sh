@@ -4,7 +4,23 @@
 set -euo pipefail
 
 echo "==> Installing dependencies"
-npm ci --no-audit --fund=false
+# --include=dev is explicit: the build needs vite/typescript, and they would be
+# skipped if NODE_ENV=production leaked into this step.
+npm ci --include=dev --no-audit --fund=false
+
+# Load the production environment (DATABASE_URL etc.) only AFTER npm ci, so the
+# NODE_ENV=production it contains cannot strip the dev dependencies above.
+ENV_FILE=/srv/reb7y/.env
+if [ -f "$ENV_FILE" ]; then
+  echo "==> Loading $ENV_FILE"
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+else
+  echo "ERROR: $ENV_FILE is missing" >&2
+  exit 1
+fi
 
 echo "==> Generating Prisma client"
 npx prisma generate
