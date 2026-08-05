@@ -7,11 +7,18 @@ import {
   loadCostTimeline,
   recordMaterialPrice,
   recordZonePrice,
+  setMaterialTimeline,
   seedCostHistory,
   resolveAsOf,
   EARLIEST_DAY,
 } from "../app/lib/costHistory.server";
-import { applyPriceChange, toPeriods, describePeriod } from "../app/lib/priceTimeline";
+import {
+  applyPriceChange,
+  toPeriods,
+  describePeriod,
+  fromEditorModel,
+  toEditorModel,
+} from "../app/lib/priceTimeline";
 import { todayString } from "../app/lib/dates";
 
 const SHOP = "verify-cost-history.myshopify.test";
@@ -152,6 +159,36 @@ async function main() {
 
   const liveAfterRange = await prisma.material.findUnique({ where: { id: box.id } });
   check("a past-only period leaves today's price alone", liveAfterRange?.costPerUnit, 15);
+
+  // --- The editor model: current price + earlier periods ---------------------
+  // What the merchant types in the add/edit form must survive a round trip.
+  const typed = {
+    current: 15,
+    periods: [{ from: "2025-08-01", to: "2025-08-15", amount: 20 }],
+  };
+  const stored = fromEditorModel(typed, EARLIEST_DAY);
+  const readBack = toEditorModel(stored, TODAY, EARLIEST_DAY);
+  check("the current price survives a round trip", readBack.current, 15);
+  check("the earlier period survives a round trip", readBack.periods.length, 1);
+  check("its start date survives", readBack.periods[0].from, "2025-08-01");
+  check("its end date survives", readBack.periods[0].to, "2025-08-15");
+  check("its price survives", readBack.periods[0].amount, 20);
+
+  // A material saved straight from the form must price orders accordingly.
+  await setMaterialTimeline({ shop: SHOP, materialId: box.id, entries: stored });
+  const formSaved = await loadCostTimeline(SHOP);
+  check("before the typed period", formSaved.costMapAt("2025-07-31").get(PRODUCT)?.materialCost, 15);
+  check("inside the typed period", formSaved.costMapAt("2025-08-10").get(PRODUCT)?.materialCost, 20);
+  check("after the typed period", formSaved.costMapAt("2025-08-16").get(PRODUCT)?.materialCost, 15);
+
+  const liveAfterForm = await prisma.material.findUnique({ where: { id: box.id } });
+  check("the list page shows the current price", liveAfterForm?.costPerUnit, 15);
+
+  check(
+    "a material with no periods stores one price",
+    fromEditorModel({ current: 12, periods: [] }, EARLIEST_DAY).length,
+    1,
+  );
 
   // --- Delivery zones behave the same way ------------------------------------
   const zone = await prisma.deliveryZone.create({

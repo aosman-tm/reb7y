@@ -29,6 +29,7 @@ import prisma from "../db.server";
 import { round2 } from "./money";
 import { todayString } from "./dates";
 import {
+  EARLIEST_DAY,
   applyPriceChange,
   amountOn,
   nextDay,
@@ -37,12 +38,10 @@ import {
 } from "./priceTimeline";
 
 export type { PriceChange, PriceEntry };
+export { EARLIEST_DAY };
 
 /** What the merchant chose when saving a new cost. */
 export type ApplyMode = "today" | "date" | "range" | "correct";
-
-/** Far enough back to cover any order a Shopify store could have. */
-export const EARLIEST_DAY = "2000-01-01";
 
 /** Per-unit cost of a product, as it stood on some day. */
 export type ProductUnitCost = {
@@ -410,6 +409,68 @@ export async function recordProductCostChange(args: {
   await syncLiveProductCost(shop, productId);
 }
 
+/**
+ * Replace a product's factory/other cost timeline with what the merchant
+ * entered.
+ *
+ * Versions are rewritten at every day any input changes — the two cost
+ * timelines plus the days its materials changed price — so each stored snapshot
+ * is complete and no day silently inherits the wrong recipe cost.
+ */
+export async function setProductExtrasTimeline(args: {
+  shop: string;
+  productId: string;
+  factory: PriceEntry[];
+  other: PriceEntry[];
+  returnDeliveryMode: string;
+  returnDeliveryPercent: number;
+}): Promise<void> {
+  const { shop, productId, factory, other, returnDeliveryMode, returnDeliveryPercent } = args;
+
+  const product = await prisma.productCost.findFirst({
+    where: { shop, productId },
+    include: { bomLines: true },
+  });
+  if (!product) return;
+
+  const materialIds = product.bomLines.map((l) => l.materialId);
+  const materialDays = materialIds.length
+    ? (
+        await prisma.materialPrice.findMany({
+          where: { shop, materialId: { in: materialIds } },
+          select: { effectiveFrom: true },
+        })
+      ).map((r) => r.effectiveFrom)
+    : [];
+
+  const days = Array.from(
+    new Set([
+      EARLIEST_DAY,
+      ...factory.map((e) => e.effectiveFrom),
+      ...other.map((e) => e.effectiveFrom),
+      ...materialDays,
+    ]),
+  ).sort();
+
+  await prisma.productCostVersion.deleteMany({ where: { shop, productId } });
+  for (const day of days) {
+    await writeProductVersion({
+      shop,
+      productId,
+      day,
+      extras: {
+        factoryCost: amountOn(factory, day) ?? 0,
+        otherCost: amountOn(other, day) ?? 0,
+        returnDeliveryMode,
+        returnDeliveryPercent,
+      },
+      reason: "edit",
+    });
+  }
+
+  await syncLiveProductCost(shop, productId);
+}
+
 /** Put the editable row back in step with the version in effect today. */
 async function syncLiveProductCost(shop: string, productId: string): Promise<void> {
   const versions = await prisma.productCostVersion.findMany({ where: { shop, productId } });
@@ -440,6 +501,24 @@ async function productsUsingMaterial(shop: string, materialId: string): Promise<
 }
 
 /**
+ * Replace a material's whole price timeline with what the merchant entered,
+ * and push the consequences into every product that uses it.
+ */
+export async function setMaterialTimeline(args: {
+  shop: string;
+  materialId: string;
+  entries: PriceEntry[];
+}): Promise<void> {
+  const { shop, materialId, entries } = args;
+  const existing = await prisma.materialPrice.findMany({ where: { shop, materialId } });
+  const before: PriceEntry[] = existing.map((e) => ({
+    effectiveFrom: e.effectiveFrom,
+    amount: e.costPerUnit,
+  }));
+  await writeMaterialEntries(shop, materialId, before, entries);
+}
+
+/**
  * Save a material price change and push the consequences into every product
  * that uses it, so their snapshots stay in step.
  */
@@ -455,7 +534,16 @@ export async function recordMaterialPrice(args: {
     effectiveFrom: e.effectiveFrom,
     amount: e.costPerUnit,
   }));
-  const after = applyPriceChange(before, change);
+  await writeMaterialEntries(shop, materialId, before, applyPriceChange(before, change));
+}
+
+async function writeMaterialEntries(
+  shop: string,
+  materialId: string,
+  before: PriceEntry[],
+  after: PriceEntry[],
+): Promise<void> {
+  if (after.length === 0) return;
 
   await prisma.$transaction([
     prisma.materialPrice.deleteMany({ where: { shop, materialId } }),
@@ -495,6 +583,15 @@ export async function recordMaterialPrice(args: {
 // Writing: delivery zone costs
 // ---------------------------------------------------------------------------
 
+/** Replace a zone's whole cost timeline with what the merchant entered. */
+export async function setZoneTimeline(args: {
+  shop: string;
+  zoneId: string;
+  entries: PriceEntry[];
+}): Promise<void> {
+  await writeZoneEntries(args.shop, args.zoneId, args.entries);
+}
+
 export async function recordZonePrice(args: {
   shop: string;
   zoneId: string;
@@ -507,7 +604,15 @@ export async function recordZonePrice(args: {
     effectiveFrom: e.effectiveFrom,
     amount: e.realCost,
   }));
-  const after = applyPriceChange(before, change);
+  await writeZoneEntries(shop, zoneId, applyPriceChange(before, change));
+}
+
+async function writeZoneEntries(
+  shop: string,
+  zoneId: string,
+  after: PriceEntry[],
+): Promise<void> {
+  if (after.length === 0) return;
 
   await prisma.$transaction([
     prisma.deliveryZonePrice.deleteMany({ where: { shop, zoneId } }),
@@ -617,19 +722,30 @@ function indexHistory<T>(
   return out;
 }
 
-/** A product's factory + other cost over time, for previewing a change. */
+/** A product's factory and other cost over time, each as its own timeline. */
 export async function productExtrasHistory(
   shop: string,
   productId: string,
-): Promise<PriceEntry[]> {
+): Promise<{ factory: PriceEntry[]; other: PriceEntry[] }> {
   const rows = await prisma.productCostVersion.findMany({
     where: { shop, productId },
     orderBy: { effectiveFrom: "asc" },
   });
-  return rows.map((r) => ({
-    effectiveFrom: r.effectiveFrom,
-    amount: round2(r.factoryCost + r.otherCost),
-  }));
+
+  // Versions exist per day for several reasons (a material moved, a cost was
+  // edited), so collapse runs where the value did not actually change.
+  const collapse = (pick: (r: (typeof rows)[number]) => number): PriceEntry[] => {
+    const out: PriceEntry[] = [];
+    for (const row of rows) {
+      const amount = round2(pick(row));
+      if (out.length === 0 || out[out.length - 1].amount !== amount) {
+        out.push({ effectiveFrom: row.effectiveFrom, amount });
+      }
+    }
+    return out;
+  };
+
+  return { factory: collapse((r) => r.factoryCost), other: collapse((r) => r.otherCost) };
 }
 
 /** All material price histories for a shop, keyed by material id.

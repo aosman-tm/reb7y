@@ -26,12 +26,19 @@ import { parseAmount, formatMoney, round2 } from "../lib/money";
 import {
   recordProductCostChange,
   seedCostHistory,
-  priceChangeFromForm,
+  setProductExtrasTimeline,
   productExtrasHistory,
 } from "../lib/costHistory.server";
-import type { PriceChange, PriceEntry } from "../lib/priceTimeline";
+import {
+  fromEditorModel,
+  toEditorModel,
+  parseEditorModel,
+  EARLIEST_DAY,
+  type PriceChange,
+  type PriceEntry,
+} from "../lib/priceTimeline";
 import { todayString } from "../lib/dates";
-import { PriceChangeModal } from "../components/PriceChangeModal";
+import { PriceRowsEditor } from "../components/PriceRowsEditor";
 
 const PRODUCT_QUERY = `#graphql
   query Reb7yProduct($id: ID!) {
@@ -100,10 +107,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     margin: round2(price - unitCost),
     currency: settings.currency,
     today: todayString(),
-    // Past factory+other costs, so the edit screen can preview a change.
-    extrasHistory: extrasHistory.length
-      ? extrasHistory
-      : ([{ effectiveFrom: "2000-01-01", amount: round2(factoryCost + otherCost) }] as PriceEntry[]),
+    // Past factory / other costs, so the edit screen shows the full history.
+    factoryHistory: extrasHistory.factory.length
+      ? extrasHistory.factory
+      : ([{ effectiveFrom: EARLIEST_DAY, amount: factoryCost }] as PriceEntry[]),
+    otherHistory: extrasHistory.other.length
+      ? extrasHistory.other
+      : ([{ effectiveFrom: EARLIEST_DAY, amount: otherCost }] as PriceEntry[]),
     returnDeliveryMode: productCost?.returnDeliveryMode ?? "settings",
     returnDeliveryPercent: round2(productCost?.returnDeliveryPercent ?? 100),
     settingsReturnDeliveryMode: settings.returnDeliveryMode,
@@ -173,31 +183,39 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (intent === "saveExtras") {
     const returnDeliveryMode = String(form.get("returnDeliveryMode") ?? "settings");
     const returnDeliveryPercent = parseAmount(form.get("returnDeliveryPercent"), 100);
-    const newExtras =
-      parseAmount(form.get("factoryCost")) + parseAmount(form.get("otherCost"));
-    await withHistory(
-      async () => {
-        await prisma.productCost.upsert({
-          where: { shop_productId: { shop, productId: gid } },
-          create: {
-            shop,
-            productId: gid,
-            title: String(form.get("title") ?? ""),
-            factoryCost: parseAmount(form.get("factoryCost")),
-            otherCost: parseAmount(form.get("otherCost")),
-            returnDeliveryMode,
-            returnDeliveryPercent,
-          },
-          update: {
-            factoryCost: parseAmount(form.get("factoryCost")),
-            otherCost: parseAmount(form.get("otherCost")),
-            returnDeliveryMode,
-            returnDeliveryPercent,
-          },
-        });
+
+    // Both costs arrive as full timelines: what they are now, plus any earlier
+    // periods where they were different.
+    const factoryModel = parseEditorModel(form.get("factory"));
+    const otherModel = parseEditorModel(form.get("other"));
+
+    await prisma.productCost.upsert({
+      where: { shop_productId: { shop, productId: gid } },
+      create: {
+        shop,
+        productId: gid,
+        title: String(form.get("title") ?? ""),
+        factoryCost: factoryModel.current,
+        otherCost: otherModel.current,
+        returnDeliveryMode,
+        returnDeliveryPercent,
       },
-      { change: priceChangeFromForm(form, newExtras), reason: "edit" },
-    );
+      update: {
+        factoryCost: factoryModel.current,
+        otherCost: otherModel.current,
+        returnDeliveryMode,
+        returnDeliveryPercent,
+      },
+    });
+
+    await setProductExtrasTimeline({
+      shop,
+      productId: gid,
+      factory: fromEditorModel(factoryModel, EARLIEST_DAY),
+      other: fromEditorModel(otherModel, EARLIEST_DAY),
+      returnDeliveryMode,
+      returnDeliveryPercent,
+    });
     return { ok: true };
   }
 
@@ -356,34 +374,29 @@ export default function ProductCostEditor() {
 
   const [materialId, setMaterialId] = useState("");
   const [qty, setQty] = useState("1");
-  const [factory, setFactory] = useState(String(data.factoryCost));
-  const [other, setOther] = useState(String(data.otherCost));
+  const [factory, setFactory] = useState(() =>
+    toEditorModel(data.factoryHistory, data.today, EARLIEST_DAY),
+  );
+  const [other, setOther] = useState(() =>
+    toEditorModel(data.otherHistory, data.today, EARLIEST_DAY),
+  );
   const [returnDeliveryMode, setReturnDeliveryMode] = useState(data.returnDeliveryMode);
   const [returnDeliveryPercent, setReturnDeliveryPercent] = useState(
     String(data.returnDeliveryPercent),
   );
-  const [askWhen, setAskWhen] = useState(false);
 
-  const oldExtras = round2(data.factoryCost + data.otherCost);
-  const newExtras = round2(parseFloat(factory || "0") + parseFloat(other || "0"));
-  const extrasChanged = newExtras !== oldExtras;
-
-  const saveExtras = (applyMode: string, applyFrom: string, applyTo: string) => {
+  const saveExtras = () => {
     otherFetcher.submit(
       {
         _action: "saveExtras",
-        factoryCost: factory || "0",
-        otherCost: other || "0",
+        factory: JSON.stringify(factory),
+        other: JSON.stringify(other),
         returnDeliveryMode,
         returnDeliveryPercent: returnDeliveryPercent || "100",
         title: data.product.title,
-        applyMode,
-        applyFrom,
-        applyTo,
       },
       { method: "post" },
     );
-    setAskWhen(false);
   };
 
   const { product, lines, materials, currency } = data;
@@ -566,43 +579,35 @@ export default function ProductCostEditor() {
                 step={1}
               />
             )}
-            <InlineGrid columns={{ xs: 1, sm: "1fr 1fr auto" }} gap="300">
-              <TextField
-                label="Factory cost per item"
-                type="number"
-                value={factory}
-                onChange={setFactory}
-                autoComplete="off"
-                prefix={currency}
-                min={0}
-                step={0.01}
-                helpText="Your direct manufacturing/factory cost for this item."
-              />
-              <TextField
-                label="Other cost per item (labour, tape, handling…)"
-                type="number"
-                value={other}
-                onChange={setOther}
-                autoComplete="off"
-                prefix={currency}
-                min={0}
-                step={0.01}
-                helpText="Anything not tracked as a material."
-              />
-              <Box paddingBlockStart="600">
-                <Button
-                  loading={otherFetcher.state !== "idle"}
-                  onClick={() => {
-                    // Only interrupt when the money changed; the return-delivery
-                    // rule alone does not restate what a past order cost to make.
-                    if (extrasChanged) setAskWhen(true);
-                    else saveExtras("today", data.today, data.today);
-                  }}
-                >
-                  Save
-                </Button>
-              </Box>
-            </InlineGrid>
+            <PriceRowsEditor
+              label="Factory cost per item"
+              helpText="Your direct manufacturing/factory cost for this item today."
+              model={factory}
+              onChange={setFactory}
+              currency={currency}
+              today={data.today}
+            />
+
+            <Divider />
+
+            <PriceRowsEditor
+              label="Other cost per item (labour, tape, handling…)"
+              helpText="Anything not tracked as a material."
+              model={other}
+              onChange={setOther}
+              currency={currency}
+              today={data.today}
+            />
+
+            <Box>
+              <Button
+                variant="primary"
+                loading={otherFetcher.state !== "idle"}
+                onClick={saveExtras}
+              >
+                Save costs
+              </Button>
+            </Box>
 
             <Divider />
 
@@ -644,20 +649,6 @@ export default function ProductCostEditor() {
           </BlockStack>
         </Card>
       </BlockStack>
-
-      {askWhen && (
-        <PriceChangeModal
-          open
-          itemName={`${data.product.title} factory + other cost`}
-          oldValue={oldExtras}
-          newValue={newExtras}
-          currency={currency}
-          today={data.today}
-          history={data.extrasHistory}
-          onCancel={() => setAskWhen(false)}
-          onConfirm={saveExtras}
-        />
-      )}
     </Page>
   );
 }

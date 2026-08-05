@@ -11,7 +11,6 @@ import {
   TextField,
   Select,
   Button,
-  Checkbox,
   IndexTable,
   Badge,
   Banner,
@@ -24,15 +23,19 @@ import { getSettings } from "../lib/settings.server";
 import { parseAmount } from "../lib/money";
 import { fetchShopifyDeliveryZones, type ShopifyZonePreset } from "../lib/shipping.server";
 import {
+  setZoneTimeline,
   recordZonePrice,
-  seedCostHistory,
-  priceChangeFromForm,
   allZoneHistories,
-  EARLIEST_DAY,
 } from "../lib/costHistory.server";
 import { todayString } from "../lib/dates";
-import type { PriceEntry } from "../lib/priceTimeline";
-import { PriceChangeModal } from "../components/PriceChangeModal";
+import {
+  fromEditorModel,
+  toEditorModel,
+  parseEditorModel,
+  EARLIEST_DAY,
+  type PriceEntry,
+} from "../lib/priceTimeline";
+import { ZoneFormModal, type ZoneDraft } from "../components/ZoneFormModal";
 
 // Fallback zones for Egypt, used only when Shopify's own shipping zones can't be
 // read (missing `read_shipping` scope, or none configured yet). Keywords match
@@ -183,35 +186,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const name = String(form.get("name") ?? "").trim();
     if (!name) return { error: "Zone name is required." };
     const isDefault = form.get("isDefault") === "true";
+    // The form carries the whole cost timeline: what the courier charges now,
+    // plus any earlier periods where it was different.
+    const model = parseEditorModel(form.get("price"));
+    const entries = fromEditorModel(model, EARLIEST_DAY);
     const data = {
       name,
       keywords: String(form.get("keywords") ?? "").trim(),
-      realCost: parseAmount(form.get("realCost")),
+      realCost: model.current,
       isDefault,
     };
     if (intent === "create") {
       const created = await prisma.deliveryZone.create({ data: { shop, ...data } });
       if (isDefault) await clearOtherDefaults(shop, created.id);
-      // A brand new zone has always cost this, as far as the shop knows.
-      await recordZonePrice({
-        shop,
-        zoneId: created.id,
-        change: { mode: "date", amount: data.realCost, from: EARLIEST_DAY },
-      });
+      await setZoneTimeline({ shop, zoneId: created.id, entries });
     } else {
       const id = String(form.get("id"));
-      const existing = await prisma.deliveryZone.findFirst({ where: { id, shop } });
-      // Seed before the update, while the old cost is still the current value.
-      await seedCostHistory(shop);
       await prisma.deliveryZone.updateMany({ where: { id, shop }, data });
       if (isDefault) await clearOtherDefaults(shop, id);
-      if (existing && existing.realCost !== data.realCost) {
-        await recordZonePrice({
-          shop,
-          zoneId: id,
-          change: priceChangeFromForm(form, data.realCost),
-        });
-      }
+      await setZoneTimeline({ shop, zoneId: id, entries });
     }
     return { ok: true };
   }
@@ -228,26 +221,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     };
 
     const existing = await prisma.deliveryZone.findFirst({ where: { shop, name } });
+    const entries = fromEditorModel(
+      { current: data.realCost, periods: [] },
+      EARLIEST_DAY,
+    );
     if (existing) {
-      // Seed before the update, while the old cost is still the current value.
-      await seedCostHistory(shop);
       await prisma.deliveryZone.update({ where: { id: existing.id }, data });
       if (isDefault) await clearOtherDefaults(shop, existing.id);
-      if (existing.realCost !== data.realCost) {
-        await recordZonePrice({
-          shop,
-          zoneId: existing.id,
-          change: priceChangeFromForm(form, data.realCost),
-        });
-      }
+      // Quick price entry only sets today's cost; earlier periods are edited
+      // on the zone itself, so merge rather than replace.
+      await recordZonePrice({
+        shop,
+        zoneId: existing.id,
+        change: { mode: "today", amount: data.realCost, today: todayString() },
+      });
     } else {
       const created = await prisma.deliveryZone.create({ data: { shop, ...data } });
       if (isDefault) await clearOtherDefaults(shop, created.id);
-      await recordZonePrice({
-        shop,
-        zoneId: created.id,
-        change: { mode: "date", amount: data.realCost, from: EARLIEST_DAY },
-      });
+      await setZoneTimeline({ shop, zoneId: created.id, entries });
     }
     return { ok: true };
   }
@@ -365,110 +356,59 @@ function AddZone({
   );
 }
 
+
+/** One zone in the list: current cost only. Its history lives in the edit modal. */
 function ZoneRow({
   zone,
   index,
   currency,
-  today,
+  onEdit,
+  onDelete,
 }: {
   zone: ZoneWithHistory;
   index: number;
   currency: string;
-  today: string;
+  onEdit: (z: ZoneWithHistory) => void;
+  onDelete: (z: ZoneWithHistory) => void;
 }) {
-  const fetcher = useFetcher<typeof action>();
-  const [cost, setCost] = useState(String(zone.realCost));
-  const [isDefault, setIsDefault] = useState(zone.isDefault);
-  const [askWhen, setAskWhen] = useState(false);
-  const busy = fetcher.state !== "idle";
-  const dirty = cost !== String(zone.realCost) || isDefault !== zone.isDefault;
-  const priceChanged = parseFloat(cost || "0") !== zone.realCost;
-
-  const save = (applyMode: string, applyFrom: string, applyTo: string) => {
-    fetcher.submit(
-      {
-        _action: "update",
-        id: zone.id,
-        name: zone.name,
-        keywords: zone.keywords,
-        realCost: cost || "0",
-        isDefault: String(isDefault),
-        applyMode,
-        applyFrom,
-        applyTo,
-      },
-      { method: "post" },
-    );
-    setAskWhen(false);
-  };
+  const periodCount = Math.max(0, zone.history.length - 1);
 
   return (
     <IndexTable.Row id={zone.id} position={index}>
       <IndexTable.Cell>
         <InlineStack gap="200" blockAlign="center">
-          <Text as="span">{zone.name}</Text>
+          <Text as="span" fontWeight="semibold">
+            {zone.name}
+          </Text>
           {zone.isDefault && <Badge tone="info">Default</Badge>}
         </InlineStack>
       </IndexTable.Cell>
       <IndexTable.Cell>
-        <Box maxWidth="130px">
-          <TextField
-            label="Cost"
-            labelHidden
-            type="number"
-            value={cost}
-            onChange={setCost}
-            autoComplete="off"
-            prefix={currency}
-            min={0}
-            step={0.01}
-          />
-        </Box>
+        <InlineStack gap="200" blockAlign="center">
+          <Text as="span" fontWeight="semibold">
+            {zone.realCost} {currency}
+          </Text>
+          {periodCount > 0 && (
+            <Badge tone="info" size="small">
+              {periodCount === 1 ? "1 earlier cost" : `${periodCount} earlier costs`}
+            </Badge>
+          )}
+        </InlineStack>
       </IndexTable.Cell>
       <IndexTable.Cell>
-        <Checkbox label="Default" labelHidden checked={isDefault} onChange={setIsDefault} />
+        <Text as="span" tone="subdued" variant="bodySm">
+          {zone.keywords || "—"}
+        </Text>
       </IndexTable.Cell>
       <IndexTable.Cell>
         <InlineStack gap="200" align="end" blockAlign="center">
-          <Button
-            size="slim"
-            disabled={!dirty}
-            loading={busy}
-            onClick={() => {
-              // Only interrupt when the cost moved; toggling "default" changes
-              // no past order's money.
-              if (priceChanged) setAskWhen(true);
-              else save("today", today, today);
-            }}
-          >
-            Save
+          <Button size="slim" onClick={() => onEdit(zone)}>
+            Edit
           </Button>
-          <Button
-            size="slim"
-            variant="plain"
-            tone="critical"
-            onClick={() => {
-              if (confirm(`Delete zone "${zone.name}"?`)) {
-                fetcher.submit({ _action: "delete", id: zone.id }, { method: "post" });
-              }
-            }}
-          >
+          <Button size="slim" variant="plain" tone="critical" onClick={() => onDelete(zone)}>
             Delete
           </Button>
         </InlineStack>
-        {askWhen && (
-          <PriceChangeModal
-            open
-            itemName={`delivery to ${zone.name}`}
-            oldValue={zone.realCost}
-            newValue={parseFloat(cost || "0")}
-            currency={currency}
-            today={today}
-            history={zone.history}
-            onCancel={() => setAskWhen(false)}
-            onConfirm={save}
-          />
-        )}
       </IndexTable.Cell>
     </IndexTable.Row>
   );
@@ -477,9 +417,52 @@ function ZoneRow({
 export default function DeliveryPage() {
   const { zones, currency, shopifyZones, shopifyZonesError, today } = useLoaderData<typeof loader>();
   const usingLiveZones = shopifyZones.length > 0;
+  const saveFetcher = useFetcher<typeof action>();
+  const [draft, setDraft] = useState<ZoneDraft | null>(null);
+
+  const openAdd = () =>
+    setDraft({
+      id: null,
+      name: "",
+      keywords: "",
+      isDefault: false,
+      price: { current: 0, periods: [] },
+    });
+
+  const openEdit = (z: ZoneWithHistory) =>
+    setDraft({
+      id: z.id,
+      name: z.name,
+      keywords: z.keywords,
+      isDefault: z.isDefault,
+      // Show every cost ever recorded, not just today's.
+      price: toEditorModel(z.history, today, EARLIEST_DAY),
+    });
+
+  const saveDraft = () => {
+    if (!draft) return;
+    saveFetcher.submit(
+      {
+        _action: draft.id ? "update" : "create",
+        ...(draft.id ? { id: draft.id } : {}),
+        name: draft.name,
+        keywords: draft.keywords,
+        isDefault: String(draft.isDefault),
+        price: JSON.stringify(draft.price),
+      },
+      { method: "post" },
+    );
+    setDraft(null);
+  };
+
+  const deleteZone = (z: ZoneWithHistory) => {
+    if (confirm(`Delete zone "${z.name}"?`)) {
+      saveFetcher.submit({ _action: "delete", id: z.id }, { method: "post" });
+    }
+  };
 
   return (
-    <Page>
+    <Page primaryAction={{ content: "Add zone", onAction: openAdd }}>
       <TitleBar title="Delivery zones" />
       <BlockStack gap="400">
         <Banner tone="info">
@@ -513,9 +496,14 @@ export default function DeliveryPage() {
         <Card padding="0">
           {zones.length === 0 ? (
             <Box padding="500">
-              <Text as="p" tone="subdued" alignment="center">
-                No zones yet.
-              </Text>
+              <BlockStack gap="300" inlineAlign="center">
+                <Text as="p" tone="subdued" alignment="center">
+                  No zones yet.
+                </Text>
+                <Button variant="primary" onClick={openAdd}>
+                  Add zone
+                </Button>
+              </BlockStack>
             </Box>
           ) : (
             <IndexTable
@@ -523,18 +511,37 @@ export default function DeliveryPage() {
               itemCount={zones.length}
               headings={[
                 { title: "Zone" },
-                { title: "Real cost" },
-                { title: "Default" },
+                { title: "Real cost now" },
+                { title: "Matches" },
                 { title: "" },
               ]}
             >
               {zones.map((z, i) => (
-                <ZoneRow key={z.id} zone={z} index={i} currency={currency} today={today} />
+                <ZoneRow
+                  key={z.id}
+                  zone={z}
+                  index={i}
+                  currency={currency}
+                  onEdit={openEdit}
+                  onDelete={deleteZone}
+                />
               ))}
             </IndexTable>
           )}
         </Card>
       </BlockStack>
+
+      {draft && (
+        <ZoneFormModal
+          draft={draft}
+          currency={currency}
+          today={today}
+          busy={saveFetcher.state !== "idle"}
+          onChange={setDraft}
+          onCancel={() => setDraft(null)}
+          onSave={saveDraft}
+        />
+      )}
     </Page>
   );
 }

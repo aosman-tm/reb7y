@@ -7,6 +7,15 @@
  * confusion this is meant to remove.
  */
 
+/**
+ * Far enough back to cover any order a Shopify store could have.
+ *
+ * Lives here rather than in costHistory.server.ts because the edit screens need
+ * it too, and importing a `.server` module from component code would pull the
+ * database layer into the browser bundle.
+ */
+export const EARLIEST_DAY = "2000-01-01";
+
 /** One recorded price, in effect from `effectiveFrom` until the next entry. */
 export type PriceEntry = { effectiveFrom: string; amount: number };
 
@@ -116,6 +125,137 @@ export function applyPriceChange(entries: PriceEntry[], change: PriceChange): Pr
   }
 
   return sorted(next);
+}
+
+// ---------------------------------------------------------------------------
+// Rows: how a merchant edits a price
+// ---------------------------------------------------------------------------
+
+/**
+ * One price the merchant typed, covering a stretch of time.
+ *
+ * `from` empty means "since the beginning" — the merchant should not have to
+ * invent a start date for a price that was always the price.
+ * `to` null means "until now": the price currently in effect.
+ */
+export type PriceRow = { from: string; to: string | null; amount: number };
+
+/** Does this row cover `day`? */
+function rowCovers(row: PriceRow, day: string, earliestDay: string): boolean {
+  const start = row.from || earliestDay;
+  if (day < start) return false;
+  return row.to === null || day <= row.to;
+}
+
+/**
+ * Turn the rows shown on screen into the entries we store.
+ *
+ * Later rows win where two overlap, and a day no row covers falls back to the
+ * earliest price — the same rule reports use, so a gap can never leave an order
+ * with no cost at all.
+ */
+export function entriesFromRows(rows: PriceRow[], earliestDay = EARLIEST_DAY): PriceEntry[] {
+  const usable = rows.filter((r) => Number.isFinite(r.amount));
+  if (usable.length === 0) return [];
+
+  const ordered = [...usable].sort((a, b) => (a.from || earliestDay).localeCompare(b.from || earliestDay));
+  const fallback = ordered[0].amount;
+
+  // Every day a price could change: a row starting, or a row ending.
+  const boundaries = new Set<string>([earliestDay]);
+  for (const row of ordered) {
+    boundaries.add(row.from || earliestDay);
+    if (row.to) boundaries.add(nextDay(row.to));
+  }
+
+  const valueOn = (day: string): number => {
+    let found: number | null = null;
+    for (const row of ordered) {
+      if (rowCovers(row, day, earliestDay)) found = row.amount; // later rows win
+    }
+    return found ?? fallback;
+  };
+
+  const days = Array.from(boundaries).sort();
+  const entries: PriceEntry[] = [];
+  for (const day of days) {
+    const amount = valueOn(day);
+    // Only record a day where the price actually changes.
+    if (entries.length === 0 || entries[entries.length - 1].amount !== amount) {
+      entries.push({ effectiveFrom: day, amount });
+    }
+  }
+  return entries;
+}
+
+/**
+ * How the edit screen holds a price: one current amount, plus any earlier
+ * periods where it was different.
+ *
+ * The current amount is the baseline — it covers every date no period claims.
+ * That way a merchant whose price never changed only ever sees one number, and
+ * a period is something they add deliberately.
+ */
+export type PriceEditorModel = { current: number; periods: PriceRow[] };
+
+/** Stored entries -> what the edit screen shows. */
+export function toEditorModel(
+  entries: PriceEntry[],
+  today: string,
+  earliestDay = EARLIEST_DAY,
+): PriceEditorModel {
+  if (entries.length === 0) return { current: 0, periods: [] };
+
+  const current = amountOn(entries, today) ?? 0;
+  const periods = toPeriods(entries)
+    // Drop the stretch containing today: that one IS the current price.
+    .filter((p) => !(p.from <= today && (p.to === null || today <= p.to)))
+    // Drop stretches that already match the current price. The current price is
+    // the baseline and covers them anyway, so showing them as rows would add
+    // clutter the merchant never typed.
+    .filter((p) => p.amount !== current)
+    .map((p) => ({
+      from: p.from <= earliestDay ? "" : p.from,
+      to: p.to,
+      amount: p.amount,
+    }));
+
+  return { current, periods };
+}
+
+/**
+ * Read a model the edit screen submitted as JSON.
+ *
+ * Everything is re-validated: this arrives from a form, so a missing field or a
+ * non-numeric amount must produce a usable model rather than a crash.
+ */
+export function parseEditorModel(raw: unknown): PriceEditorModel {
+  try {
+    const parsed = JSON.parse(String(raw ?? "")) as Partial<PriceEditorModel>;
+    return {
+      current: Number(parsed?.current) || 0,
+      periods: Array.isArray(parsed?.periods)
+        ? parsed.periods
+            .filter((p) => p && Number.isFinite(Number(p.amount)))
+            .map((p) => ({
+              from: String(p.from ?? ""),
+              to: p.to ? String(p.to) : null,
+              amount: Number(p.amount),
+            }))
+        : [],
+    };
+  } catch {
+    return { current: 0, periods: [] };
+  }
+}
+
+/** What the edit screen shows -> the entries to store. */
+export function fromEditorModel(
+  model: PriceEditorModel,
+  earliestDay = EARLIEST_DAY,
+): PriceEntry[] {
+  const baseline: PriceRow = { from: "", to: null, amount: model.current };
+  return entriesFromRows([baseline, ...model.periods], earliestDay);
 }
 
 /** A period of one unchanging price, for display. `to` null means "still". */

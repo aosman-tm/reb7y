@@ -5,11 +5,9 @@ import {
   Page,
   Card,
   BlockStack,
-  InlineGrid,
   InlineStack,
   Text,
   TextField,
-  Select,
   Button,
   IndexTable,
   Banner,
@@ -23,16 +21,16 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
 import { computeMaterialUsage } from "../lib/profit.server";
-import {
-  recordMaterialPrice,
-  seedCostHistory,
-  priceChangeFromForm,
-  allMaterialHistories,
-  EARLIEST_DAY,
-} from "../lib/costHistory.server";
+import { setMaterialTimeline, allMaterialHistories } from "../lib/costHistory.server";
 import { todayString } from "../lib/dates";
-import { parseAmount, round2 } from "../lib/money";
-import { PriceChangeModal } from "../components/PriceChangeModal";
+import { parseAmount, formatMoney, round2 } from "../lib/money";
+import {
+  fromEditorModel,
+  toEditorModel,
+  parseEditorModel,
+  EARLIEST_DAY,
+} from "../lib/priceTimeline";
+import { MaterialFormModal, type MaterialDraft } from "../components/MaterialFormModal";
 
 const BUILT_IN_UNITS = ["piece", "cm", "meter", "gram", "kg", "ml", "liter", "roll", "sheet"];
 
@@ -93,19 +91,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "create" || intent === "update") {
     const name = String(form.get("name") ?? "").trim();
     if (!name) return { error: "Name is required." };
-    const costPerUnit = parseAmount(form.get("costPerUnit"));
-    const data = { name, unit: String(form.get("unit") ?? "piece"), costPerUnit };
+
+    // The form carries the whole price timeline the merchant sees: what it
+    // costs now, plus any earlier periods where it was different.
+    const model = parseEditorModel(form.get("price"));
+    const entries = fromEditorModel(model, EARLIEST_DAY);
+    const data = { name, unit: String(form.get("unit") ?? "piece"), costPerUnit: model.current };
 
     if (intent === "create") {
       const created = await prisma.material.create({
         data: { shop, ...data, stock: parseAmount(form.get("stock")) },
       });
-      // A brand new material has always cost this, as far as the shop knows.
-      await recordMaterialPrice({
-        shop,
-        materialId: created.id,
-        change: { mode: "date", amount: costPerUnit, from: EARLIEST_DAY },
-      });
+      await setMaterialTimeline({ shop, materialId: created.id, entries });
       return { ok: true };
     }
 
@@ -113,20 +110,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const existing = await prisma.material.findFirst({ where: { id, shop } });
     if (!existing) return { error: "Material not found." };
 
-    // Seed BEFORE the update: seeding records the material's current cost as
-    // its historical baseline, so it has to happen while that value is still
-    // the old one.
-    await seedCostHistory(shop);
-
     await prisma.material.updateMany({ where: { id, shop }, data });
-
-    if (costPerUnit !== existing.costPerUnit) {
-      await recordMaterialPrice({
-        shop,
-        materialId: id,
-        change: priceChangeFromForm(form, costPerUnit),
-      });
-    }
+    await setMaterialTimeline({ shop, materialId: id, entries });
     return { ok: true };
   }
 
@@ -172,79 +157,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   return { error: "Unknown action." };
 };
-
-function AddMaterial({ units }: { units: string[] }) {
-  const fetcher = useFetcher<typeof action>();
-  const [name, setName] = useState("");
-  const [unit, setUnit] = useState("piece");
-  const [cost, setCost] = useState("");
-  const [stock, setStock] = useState("");
-  const busy = fetcher.state !== "idle";
-
-  return (
-    <Card>
-      <BlockStack gap="300">
-        <Text as="h2" variant="headingMd">
-          Add a material
-        </Text>
-        <InlineGrid columns={{ xs: 1, sm: "2fr 1fr 1fr 1fr auto" }} gap="300">
-          <TextField
-            label="Name"
-            value={name}
-            onChange={setName}
-            autoComplete="off"
-            placeholder="e.g. Small box"
-          />
-          <Select
-            label="Unit"
-            options={units.map((u) => ({ label: u, value: u }))}
-            value={unit}
-            onChange={setUnit}
-          />
-          <TextField
-            label="Cost per unit"
-            type="number"
-            value={cost}
-            onChange={setCost}
-            autoComplete="off"
-            prefix="EGP"
-            min={0}
-            step={0.01}
-          />
-          <TextField
-            label="Starting stock"
-            type="number"
-            value={stock}
-            onChange={setStock}
-            autoComplete="off"
-            min={0}
-            step={1}
-            placeholder="0"
-          />
-          <Box paddingBlockStart="600">
-            <Button
-              variant="primary"
-              disabled={!name.trim()}
-              loading={busy}
-              onClick={() => {
-                fetcher.submit(
-                  { _action: "create", name, unit, costPerUnit: cost || "0", stock: stock || "0" },
-                  { method: "post" },
-                );
-                setName("");
-                setCost("");
-                setStock("");
-                setUnit("piece");
-              }}
-            >
-              Add
-            </Button>
-          </Box>
-        </InlineGrid>
-      </BlockStack>
-    </Card>
-  );
-}
 
 function UnitManager({
   units,
@@ -316,72 +228,48 @@ type MaterialItem = {
   history: { effectiveFrom: string; amount: number }[];
 };
 
+/** One material in the list: current cost only. Its history lives in the edit modal. */
 function MaterialRow({
   material,
   index,
-  units,
   currency,
-  today,
+  onEdit,
   onRestock,
+  onDelete,
 }: {
   material: MaterialItem;
   index: number;
-  units: string[];
   currency: string;
-  today: string;
+  onEdit: (m: MaterialItem) => void;
   onRestock: (m: MaterialItem) => void;
+  onDelete: (m: MaterialItem) => void;
 }) {
-  const fetcher = useFetcher<typeof action>();
-  const [name, setName] = useState(material.name);
-  const [unit, setUnit] = useState(material.unit);
-  const [cost, setCost] = useState(String(material.costPerUnit));
-  const [askWhen, setAskWhen] = useState(false);
-  const busy = fetcher.state !== "idle";
-  const priceChanged = parseFloat(cost || "0") !== material.costPerUnit;
-  const dirty =
-    name !== material.name || unit !== material.unit || cost !== String(material.costPerUnit);
-  const unitOptions = units.map((u) => ({ label: u, value: u }));
-  if (!units.includes(unit)) unitOptions.unshift({ label: unit, value: unit });
-
-  const save = (applyMode: string, applyFrom: string, applyTo: string) => {
-    fetcher.submit(
-      {
-        _action: "update",
-        id: material.id,
-        name,
-        unit,
-        costPerUnit: cost || "0",
-        applyMode,
-        applyFrom,
-        applyTo,
-      },
-      { method: "post" },
-    );
-    setAskWhen(false);
-  };
+  // More than one recorded price means this material has a past worth showing.
+  const periodCount = Math.max(0, material.history.length - 1);
 
   return (
     <IndexTable.Row id={material.id} position={index}>
       <IndexTable.Cell>
-        <TextField label="Name" labelHidden value={name} onChange={setName} autoComplete="off" />
+        <Text as="span" fontWeight="semibold">
+          {material.name}
+        </Text>
       </IndexTable.Cell>
       <IndexTable.Cell>
-        <Select label="Unit" labelHidden options={unitOptions} value={unit} onChange={setUnit} />
+        <Text as="span" tone="subdued">
+          {material.unit}
+        </Text>
       </IndexTable.Cell>
       <IndexTable.Cell>
-        <Box maxWidth="120px">
-          <TextField
-            label="Cost"
-            labelHidden
-            type="number"
-            value={cost}
-            onChange={setCost}
-            autoComplete="off"
-            prefix="EGP"
-            min={0}
-            step={0.01}
-          />
-        </Box>
+        <InlineStack gap="200" blockAlign="center">
+          <Text as="span" fontWeight="semibold">
+            {formatMoney(material.costPerUnit, currency)}
+          </Text>
+          {periodCount > 0 && (
+            <Badge tone="info" size="small">
+              {periodCount === 1 ? "1 earlier price" : `${periodCount} earlier prices`}
+            </Badge>
+          )}
+        </InlineStack>
       </IndexTable.Cell>
       <IndexTable.Cell>
         <BlockStack gap="050">
@@ -402,48 +290,16 @@ function MaterialRow({
       </IndexTable.Cell>
       <IndexTable.Cell>
         <InlineStack gap="200" align="end" blockAlign="center">
-          <Button
-            size="slim"
-            disabled={!dirty}
-            loading={busy}
-            onClick={() => {
-              // Only interrupt when the money actually moved; renaming a
-              // material has no effect on any past report.
-              if (priceChanged) setAskWhen(true);
-              else save("today", today, today);
-            }}
-          >
-            Save
+          <Button size="slim" onClick={() => onEdit(material)}>
+            Edit
           </Button>
           <Button size="slim" onClick={() => onRestock(material)}>
             Restock
           </Button>
-          <Button
-            size="slim"
-            variant="plain"
-            tone="critical"
-            onClick={() => {
-              if (confirm(`Delete "${material.name}"?`)) {
-                fetcher.submit({ _action: "delete", id: material.id }, { method: "post" });
-              }
-            }}
-          >
+          <Button size="slim" variant="plain" tone="critical" onClick={() => onDelete(material)}>
             Delete
           </Button>
         </InlineStack>
-        {askWhen && (
-          <PriceChangeModal
-            open
-            itemName={material.name}
-            oldValue={material.costPerUnit}
-            newValue={parseFloat(cost || "0")}
-            currency={currency}
-            today={today}
-            history={material.history}
-            onCancel={() => setAskWhen(false)}
-            onConfirm={save}
-          />
-        )}
       </IndexTable.Cell>
     </IndexTable.Row>
   );
@@ -453,9 +309,52 @@ export default function MaterialsPage() {
   const { materials, customUnits, units, currency, today } = useLoaderData<typeof loader>();
   const restockFetcher = useFetcher<typeof action>();
 
+  const saveFetcher = useFetcher<typeof action>();
+  const [draft, setDraft] = useState<MaterialDraft | null>(null);
   const [restock, setRestock] = useState<MaterialItem | null>(null);
   const [addQty, setAddQty] = useState("");
   const [threshold, setThreshold] = useState("");
+
+  const openAdd = () =>
+    setDraft({
+      id: null,
+      name: "",
+      unit: "piece",
+      stock: "",
+      price: { current: 0, periods: [] },
+    });
+
+  const openEdit = (m: MaterialItem) =>
+    setDraft({
+      id: m.id,
+      name: m.name,
+      unit: m.unit,
+      stock: String(m.stock),
+      // Show every price ever recorded, not just today's.
+      price: toEditorModel(m.history, today, EARLIEST_DAY),
+    });
+
+  const saveDraft = () => {
+    if (!draft) return;
+    saveFetcher.submit(
+      {
+        _action: draft.id ? "update" : "create",
+        ...(draft.id ? { id: draft.id } : {}),
+        name: draft.name,
+        unit: draft.unit,
+        stock: draft.stock || "0",
+        price: JSON.stringify(draft.price),
+      },
+      { method: "post" },
+    );
+    setDraft(null);
+  };
+
+  const deleteMaterial = (m: MaterialItem) => {
+    if (confirm(`Delete "${m.name}"?`)) {
+      saveFetcher.submit({ _action: "delete", id: m.id }, { method: "post" });
+    }
+  };
 
   const openRestock = (m: MaterialItem) => {
     setRestock(m);
@@ -473,7 +372,9 @@ export default function MaterialsPage() {
   };
 
   return (
-    <Page>
+    <Page
+      primaryAction={{ content: "Add material", onAction: openAdd }}
+    >
       <TitleBar title="Materials" />
       <BlockStack gap="400">
         <Banner tone="info">
@@ -485,15 +386,19 @@ export default function MaterialsPage() {
           </p>
         </Banner>
 
-        <AddMaterial units={units} />
         <UnitManager units={units} customUnits={customUnits} />
 
         <Card padding="0">
           {materials.length === 0 ? (
             <Box padding="500">
-              <Text as="p" tone="subdued" alignment="center">
-                No materials yet. Add your first one above.
-              </Text>
+              <BlockStack gap="300" inlineAlign="center">
+                <Text as="p" tone="subdued" alignment="center">
+                  No materials yet.
+                </Text>
+                <Button variant="primary" onClick={openAdd}>
+                  Add material
+                </Button>
+              </BlockStack>
             </Box>
           ) : (
             <IndexTable
@@ -512,16 +417,29 @@ export default function MaterialsPage() {
                   key={m.id}
                   material={m}
                   index={i}
-                  units={units}
                   currency={currency}
-                  today={today}
+                  onEdit={openEdit}
                   onRestock={openRestock}
+                  onDelete={deleteMaterial}
                 />
               ))}
             </IndexTable>
           )}
         </Card>
       </BlockStack>
+
+      {draft && (
+        <MaterialFormModal
+          draft={draft}
+          units={units}
+          currency={currency}
+          today={today}
+          busy={saveFetcher.state !== "idle"}
+          onChange={setDraft}
+          onCancel={() => setDraft(null)}
+          onSave={saveDraft}
+        />
+      )}
 
       {restock && (
         <Modal
