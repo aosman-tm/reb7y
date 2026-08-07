@@ -13,11 +13,19 @@ import {
   Checkbox,
   Banner,
   InlineStack,
+  Box,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
+import {
+  recordSettingsVersion,
+  seedSettingsBaseline,
+  settingsVersionHistory,
+} from "../lib/costHistory.server";
+import { todayString } from "../lib/dates";
+import { formatDay } from "../lib/priceTimeline";
 import { parseAmount } from "../lib/money";
 
 const CURRENCIES = ["EGP", "USD", "GBP", "EUR", "SAR", "AED"].map((c) => ({
@@ -40,8 +48,11 @@ const DEPOSIT_OPTIONS = [
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const settings = await getSettings(session.shop);
-  return { settings };
+  const [settings, history] = await Promise.all([
+    getSettings(session.shop),
+    settingsVersionHistory(session.shop),
+  ]);
+  return { settings, history, today: todayString() };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -61,18 +72,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     depositMode,
     depositValue: depositMode === "none" ? 0 : parseAmount(form.get("depositValue"), 0),
   };
+  const previous = await getSettings(shop);
+
+  // Baseline the OLD rules before the new ones land. Without this the first
+  // change becomes the oldest recorded version and applies backwards over
+  // every order ever placed.
+  await seedSettingsBaseline(shop, previous);
+
   await prisma.settings.upsert({
     where: { shop },
     create: { shop, ...data },
     update: data,
   });
+
+  const raw = String(form.get("effectiveFrom") ?? "");
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : todayString();
+  await recordSettingsVersion({ shop, day, rules: data });
+
   return { ok: true };
 };
 
 export default function SettingsPage() {
-  const { settings } = useLoaderData<typeof loader>();
+  const { settings, history, today } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
 
+  const [effectiveFrom, setEffectiveFrom] = useState(today);
   const [currency, setCurrency] = useState(settings.currency);
   const [feePct, setFeePct] = useState(String(settings.paymentFeePercent));
   const [feeFlat, setFeeFlat] = useState(String(settings.paymentFeeFlat));
@@ -229,6 +253,50 @@ export default function SettingsPage() {
           </BlockStack>
         </Card>
 
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h2" variant="headingMd">
+              When do these rules start?
+            </Text>
+            <Text as="p" tone="subdued">
+              Orders before this date keep the rules that applied then, so your finished reports do
+              not change. Set an earlier date if a fee actually changed a while ago and you are
+              entering it late.
+            </Text>
+            <Box maxWidth="240px">
+              <TextField
+                label="These rules apply from"
+                type="date"
+                value={effectiveFrom}
+                max={today}
+                onChange={setEffectiveFrom}
+                autoComplete="off"
+              />
+            </Box>
+
+            {history.length > 0 && (
+              <BlockStack gap="150">
+                <Text as="h3" variant="headingSm">
+                  Earlier rules
+                </Text>
+                {history.map((h) => (
+                  <InlineStack key={h.effectiveFrom} gap="300" align="space-between">
+                    <Text as="span" tone="subdued">
+                      {h.effectiveFrom <= "2000-01-01"
+                        ? "From the beginning"
+                        : `From ${formatDay(h.effectiveFrom)}`}
+                    </Text>
+                    <Text as="span" tone="subdued">
+                      card {h.paymentFeePercent}% · COD {h.codFeePercent}% · deposit{" "}
+                      {h.depositMode}
+                    </Text>
+                  </InlineStack>
+                ))}
+              </BlockStack>
+            )}
+          </BlockStack>
+        </Card>
+
         <InlineStack align="end">
           <Button
             variant="primary"
@@ -246,6 +314,7 @@ export default function SettingsPage() {
                   returnDeliveryFixed: returnDeliveryFixed || "0",
                   depositMode,
                   depositValue: depositValue || "0",
+                  effectiveFrom,
                 },
                 { method: "post" },
               )

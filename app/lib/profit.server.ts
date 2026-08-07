@@ -12,7 +12,16 @@ import prisma from "../db.server";
 import { getSettings, type ShopSettings } from "./settings.server";
 import { round2 } from "./money";
 import { daysInclusive, todayString, daysAgoString } from "./dates";
-import { loadCostTimeline, type CostMap, type ProductUnitCost, type Zone } from "./costHistory.server";
+import {
+  loadCostTimeline,
+  loadRulesTimeline,
+  allSalaryHistories,
+  allExpenseHistories,
+  type CostMap,
+  type ProductUnitCost,
+  type Zone,
+} from "./costHistory.server";
+import { toPeriods, EARLIEST_DAY } from "./priceTimeline";
 
 export type { CostMap, ProductUnitCost, Zone };
 
@@ -579,21 +588,37 @@ export async function buildReport(
   startDay: string,
   endDay: string,
 ): Promise<Report> {
-  const [timeline, settings, overrideRows, adRows, expenseRows, workerRows, paymentRows, fetched] =
-    await Promise.all([
-      loadCostTimeline(shop),
-      getSettings(shop),
-      prisma.orderCost.findMany({ where: { shop } }),
-      prisma.adSpend.findMany({
-        where: { shop, date: { gte: startDay, lte: endDay } },
-      }),
-      prisma.expense.findMany({ where: { shop, active: true } }),
-      prisma.worker.findMany({ where: { shop, active: true } }),
-      prisma.workerPayment.findMany({
-        where: { shop, date: { gte: startDay, lte: endDay } },
-      }),
-      fetchOrders(admin, startDay, endDay),
-    ]);
+  const [
+    timeline,
+    settings,
+    overrideRows,
+    adRows,
+    expenseRows,
+    workerRows,
+    paymentRows,
+    salaryHistories,
+    expenseHistories,
+    fetched,
+  ] = await Promise.all([
+    loadCostTimeline(shop),
+    getSettings(shop),
+    prisma.orderCost.findMany({ where: { shop } }),
+    prisma.adSpend.findMany({
+      where: { shop, date: { gte: startDay, lte: endDay } },
+    }),
+    prisma.expense.findMany({ where: { shop, active: true } }),
+    prisma.worker.findMany({ where: { shop, active: true } }),
+    prisma.workerPayment.findMany({
+      where: { shop, date: { gte: startDay, lte: endDay } },
+    }),
+    allSalaryHistories(shop),
+    allExpenseHistories(shop),
+    fetchOrders(admin, startDay, endDay),
+  ]);
+
+  // Fee, deposit and return rules as they stood on each order's own day, so
+  // raising a COD fee today cannot restate last month's orders.
+  const rulesAt = await loadRulesTimeline(shop, settings);
 
   const overrideMap = new Map(
     overrideRows.map((o) => [
@@ -617,7 +642,7 @@ export async function buildReport(
     computeOrderPnl(o, {
       costMap: timeline.costMapAt(dayOf(o)),
       zones: timeline.zonesAt(dayOf(o)),
-      settings,
+      settings: { ...settings, ...rulesAt(dayOf(o)) },
       override: overrideMap.get(o.id),
     }),
   );
@@ -688,14 +713,35 @@ export async function buildReport(
   const adSpend = round2(adRows.reduce((s, r) => s + r.amount, 0));
 
   // --- Overheads (prorated expenses) and payroll (prorated salaries + bonuses). ---
-  const rangeDays = daysInclusive(startDay, endDay);
+
+
+  // Both of these are prorated across the range, so an amount that changed
+  // part-way through has to be applied only to the days it actually covered.
   const overheads = round2(
     expenseRows.reduce(
-      (s, e) => s + prorateExpense(e.amount, e.frequency, e.date, startDay, endDay, rangeDays),
+      (s, e) =>
+        s +
+        prorateOverTime(
+          expenseHistories[e.id] ?? [{ effectiveFrom: EARLIEST_DAY, amount: e.amount }],
+          startDay,
+          endDay,
+          (amount, days) => prorateExpense(amount, e.frequency, e.date, startDay, endDay, days),
+        ),
       0,
     ),
   );
-  const salaryCost = workerRows.reduce((s, w) => s + (w.monthlySalary * rangeDays) / 30, 0);
+
+  const salaryCost = workerRows.reduce(
+    (s, w) =>
+      s +
+      prorateOverTime(
+        salaryHistories[w.id] ?? [{ effectiveFrom: EARLIEST_DAY, amount: w.monthlySalary }],
+        startDay,
+        endDay,
+        (amount, days) => (amount * days) / 30,
+      ),
+    0,
+  );
   const bonusCost = paymentRows.reduce((s, p) => s + p.amount, 0);
   const payroll = round2(salaryCost + bonusCost);
 
@@ -757,6 +803,36 @@ export async function buildReportSafe(
 // ---------------------------------------------------------------------------
 // Expenses & payroll proration
 // ---------------------------------------------------------------------------
+
+/**
+ * Apply a recurring cost across a range, honouring the days each amount covered.
+ *
+ * A salary that went from 3000 to 3500 half-way through a month cost 3000 for
+ * the first half and 3500 for the second. Using only today's amount would
+ * restate every earlier month the moment a raise is entered.
+ *
+ * `rate(amount, days)` says what `amount` costs over `days` — the caller keeps
+ * its own proration rule (monthly, weekly, one-off…).
+ */
+export function prorateOverTime(
+  entries: { effectiveFrom: string; amount: number }[],
+  rangeStart: string,
+  rangeEnd: string,
+  rate: (amount: number, days: number) => number,
+): number {
+  if (entries.length === 0) return 0;
+
+  const periods = toPeriods(entries);
+  let total = 0;
+  for (const period of periods) {
+    // Clip the period to the report's range; skip it if they do not overlap.
+    const from = period.from > rangeStart ? period.from : rangeStart;
+    const to = period.to === null || period.to > rangeEnd ? rangeEnd : period.to;
+    if (from > to) continue;
+    total += rate(period.amount, daysInclusive(from, to));
+  }
+  return total;
+}
 
 /** How much a single expense costs over a date range, based on its schedule.
  * Recurring costs are normalised to a daily rate; one-off costs count only if

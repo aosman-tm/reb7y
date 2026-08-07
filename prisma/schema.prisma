@@ -129,6 +129,58 @@ model DeliveryZonePrice {
   @@index([shop, zoneId, effectiveFrom])
 }
 
+/// The money rules as they stood from `effectiveFrom` onward — a full snapshot,
+/// so raising a COD fee today cannot restate what last month's orders cost you.
+/// Mirrors the fee/deposit/return fields of Settings.
+model SettingsVersion {
+  id                    String   @id @default(cuid())
+  shop                  String
+  effectiveFrom         String // YYYY-MM-DD
+  paymentFeePercent     Float    @default(0)
+  paymentFeeFlat        Float    @default(0)
+  codFeePercent         Float    @default(0)
+  codRoundTripDefault   Boolean  @default(false)
+  returnDeliveryMode    String   @default("full")
+  returnDeliveryPercent Float    @default(100)
+  returnDeliveryFixed   Float    @default(0)
+  depositMode           String   @default("none")
+  depositValue          Float    @default(0)
+  createdAt             DateTime @default(now())
+
+  @@unique([shop, effectiveFrom])
+  @@index([shop, effectiveFrom])
+}
+
+/// A worker's monthly salary from `effectiveFrom` onward, so a raise does not
+/// rewrite what payroll cost in earlier months.
+model WorkerSalary {
+  id            String   @id @default(cuid())
+  shop          String
+  workerId      String
+  worker        Worker   @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  monthlySalary Float
+  effectiveFrom String // YYYY-MM-DD
+  createdAt     DateTime @default(now())
+
+  @@unique([shop, workerId, effectiveFrom])
+  @@index([shop, workerId, effectiveFrom])
+}
+
+/// A recurring expense's amount from `effectiveFrom` onward — a rent increase
+/// should not change what rent cost before it happened.
+model ExpenseAmount {
+  id            String   @id @default(cuid())
+  shop          String
+  expenseId     String
+  expense       Expense  @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  amount        Float
+  effectiveFrom String // YYYY-MM-DD
+  createdAt     DateTime @default(now())
+
+  @@unique([shop, expenseId, effectiveFrom])
+  @@index([shop, expenseId, effectiveFrom])
+}
+
 /// A custom measurement unit the merchant added (on top of the built-in ones).
 model CustomUnit {
   id        String   @id @default(cuid())
@@ -260,6 +312,7 @@ model Expense {
   note       String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+  amounts    ExpenseAmount[]
 
   @@index([shop])
 }
@@ -277,6 +330,7 @@ model Worker {
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
   payments      WorkerPayment[]
+  salaries      WorkerSalary[]
 
   @@index([shop])
 }

@@ -9,6 +9,9 @@ import {
   recordZonePrice,
   setMaterialTimeline,
   seedCostHistory,
+  seedSettingsBaseline,
+  recordSettingsVersion,
+  loadRulesTimeline,
   resolveAsOf,
   EARLIEST_DAY,
 } from "../app/lib/costHistory.server";
@@ -20,6 +23,8 @@ import {
   toEditorModel,
 } from "../app/lib/priceTimeline";
 import { todayString } from "../app/lib/dates";
+import { prorateOverTime } from "../app/lib/profit.server";
+import { round2 } from "../app/lib/money";
 
 const SHOP = "verify-cost-history.myshopify.test";
 const PRODUCT = "gid://shopify/Product/VERIFY1";
@@ -207,6 +212,56 @@ async function main() {
   const augZone = zoneTimeline.zonesAt("2026-08-05").find((z) => z.id === zone.id);
   check("a July order keeps the old 50 EGP courier cost", julyZone?.realCost, 50);
   check("an August order uses the new 65 EGP courier cost", augZone?.realCost, 65);
+
+  // --- A salary raise must not restate earlier payroll -----------------------
+  // 3000/month until 30 Jun 2026, then 3500 from 1 Jul.
+  const salary = fromEditorModel(
+    { current: 3500, periods: [{ from: "", to: "2026-06-30", amount: 3000 }] },
+    EARLIEST_DAY,
+  );
+  const monthly = (amount: number, days: number) => (amount * days) / 30;
+
+  check(
+    "June payroll uses the old salary",
+    round2(prorateOverTime(salary, "2026-06-01", "2026-06-30", monthly)),
+    3000, // 30 days at 3000/30 per day
+  );
+  check(
+    "July payroll uses the new salary",
+    round2(prorateOverTime(salary, "2026-07-01", "2026-07-31", monthly)),
+    round2((3500 * 31) / 30),
+  );
+  check(
+    "a range spanning the raise splits it",
+    round2(prorateOverTime(salary, "2026-06-16", "2026-07-15", monthly)),
+    round2((3000 * 15) / 30 + (3500 * 15) / 30),
+  );
+
+  // --- Money rules are resolved per order date -------------------------------
+  const baseRules = {
+    paymentFeePercent: 0,
+    paymentFeeFlat: 0,
+    codFeePercent: 0,
+    codRoundTripDefault: false,
+    returnDeliveryMode: "full",
+    returnDeliveryPercent: 100,
+    returnDeliveryFixed: 0,
+    depositMode: "none",
+    depositValue: 0,
+  };
+  await prisma.settingsVersion.deleteMany({ where: { shop: SHOP } });
+  await seedSettingsBaseline(SHOP, baseRules);
+  await recordSettingsVersion({
+    shop: SHOP,
+    day: "2026-07-01",
+    rules: { ...baseRules, codFeePercent: 2 },
+  });
+
+  const rulesAt = await loadRulesTimeline(SHOP, baseRules);
+  check("an order before the fee change pays no COD fee", rulesAt("2026-06-15").codFeePercent, 0);
+  check("an order after it pays the new COD fee", rulesAt("2026-07-15").codFeePercent, 2);
+  check("today uses the newest rules", rulesAt(TODAY).codFeePercent, 2);
+  await prisma.settingsVersion.deleteMany({ where: { shop: SHOP } });
 
   // --- Seeding is idempotent -------------------------------------------------
   const before = await prisma.materialPrice.count({ where: { shop: SHOP } });

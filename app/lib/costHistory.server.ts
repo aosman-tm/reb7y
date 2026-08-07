@@ -633,6 +633,197 @@ async function writeZoneEntries(
 }
 
 // ---------------------------------------------------------------------------
+// Money rules (Settings) over time
+// ---------------------------------------------------------------------------
+
+/** The fee / deposit / return rules that decide an order's profit. */
+export type MoneyRules = {
+  paymentFeePercent: number;
+  paymentFeeFlat: number;
+  codFeePercent: number;
+  codRoundTripDefault: boolean;
+  returnDeliveryMode: string;
+  returnDeliveryPercent: number;
+  returnDeliveryFixed: number;
+  depositMode: string;
+  depositValue: number;
+};
+
+function rulesOf(row: MoneyRules): MoneyRules {
+  return {
+    paymentFeePercent: row.paymentFeePercent,
+    paymentFeeFlat: row.paymentFeeFlat,
+    codFeePercent: row.codFeePercent,
+    codRoundTripDefault: row.codRoundTripDefault,
+    returnDeliveryMode: row.returnDeliveryMode,
+    returnDeliveryPercent: row.returnDeliveryPercent,
+    returnDeliveryFixed: row.returnDeliveryFixed,
+    depositMode: row.depositMode,
+    depositValue: row.depositValue,
+  };
+}
+
+/**
+ * Resolve the money rules that applied on any given day.
+ *
+ * Loaded once and memoised per day, the same way costs are, so a report over a
+ * range does not re-query for every order.
+ */
+export async function loadRulesTimeline(
+  shop: string,
+  live: MoneyRules,
+): Promise<(day: string) => MoneyRules> {
+  const versions = await prisma.settingsVersion.findMany({ where: { shop } });
+  if (versions.length === 0) return () => live;
+
+  const cache = new Map<string, MoneyRules>();
+  return (day: string) => {
+    const hit = cache.get(day);
+    if (hit) return hit;
+    const version = resolveAsOf(versions, day);
+    const rules = version ? rulesOf(version) : live;
+    cache.set(day, rules);
+    return rules;
+  };
+}
+
+/**
+ * Give the shop's existing rules a starting version, dated far enough back to
+ * cover every order. Must run BEFORE new rules are saved: it records the
+ * current rules as the historical baseline, so it has to see the old ones.
+ * Only fills a gap, so it is safe to call on every save.
+ */
+export async function seedSettingsBaseline(shop: string, current: MoneyRules): Promise<void> {
+  const count = await prisma.settingsVersion.count({ where: { shop } });
+  if (count > 0) return;
+  await prisma.settingsVersion.create({
+    data: { shop, effectiveFrom: EARLIEST_DAY, ...rulesOf(current) },
+  });
+}
+
+/** Every recorded set of rules, newest first, for showing on the settings page. */
+export async function settingsVersionHistory(
+  shop: string,
+): Promise<{ effectiveFrom: string; paymentFeePercent: number; codFeePercent: number; depositMode: string }[]> {
+  const rows = await prisma.settingsVersion.findMany({
+    where: { shop },
+    orderBy: { effectiveFrom: "desc" },
+  });
+  return rows.map((r) => ({
+    effectiveFrom: r.effectiveFrom,
+    paymentFeePercent: r.paymentFeePercent,
+    codFeePercent: r.codFeePercent,
+    depositMode: r.depositMode,
+  }));
+}
+
+/** Record the money rules in effect from `day` onward. */
+export async function recordSettingsVersion(args: {
+  shop: string;
+  day: string;
+  rules: MoneyRules;
+}): Promise<void> {
+  const { shop, day, rules } = args;
+  await prisma.settingsVersion.upsert({
+    where: { shop_effectiveFrom: { shop, effectiveFrom: day } },
+    create: { shop, effectiveFrom: day, ...rules },
+    update: { ...rules },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Salaries and expense amounts over time
+// ---------------------------------------------------------------------------
+
+/** Replace a worker's salary timeline. */
+export async function setSalaryTimeline(args: {
+  shop: string;
+  workerId: string;
+  entries: PriceEntry[];
+}): Promise<void> {
+  const { shop, workerId, entries } = args;
+  if (entries.length === 0) return;
+
+  await prisma.$transaction([
+    prisma.workerSalary.deleteMany({ where: { shop, workerId } }),
+    ...entries.map((e) =>
+      prisma.workerSalary.create({
+        data: { shop, workerId, monthlySalary: e.amount, effectiveFrom: e.effectiveFrom },
+      }),
+    ),
+  ]);
+
+  const now = amountOn(entries, todayString());
+  if (now != null) {
+    await prisma.worker.updateMany({ where: { id: workerId, shop }, data: { monthlySalary: now } });
+  }
+}
+
+/** Replace an expense's amount timeline. */
+export async function setExpenseTimeline(args: {
+  shop: string;
+  expenseId: string;
+  entries: PriceEntry[];
+}): Promise<void> {
+  const { shop, expenseId, entries } = args;
+  if (entries.length === 0) return;
+
+  await prisma.$transaction([
+    prisma.expenseAmount.deleteMany({ where: { shop, expenseId } }),
+    ...entries.map((e) =>
+      prisma.expenseAmount.create({
+        data: { shop, expenseId, amount: e.amount, effectiveFrom: e.effectiveFrom },
+      }),
+    ),
+  ]);
+
+  const now = amountOn(entries, todayString());
+  if (now != null) {
+    await prisma.expense.updateMany({ where: { id: expenseId, shop }, data: { amount: now } });
+  }
+}
+
+export async function salaryHistory(shop: string, workerId: string): Promise<PriceEntry[]> {
+  const rows = await prisma.workerSalary.findMany({
+    where: { shop, workerId },
+    orderBy: { effectiveFrom: "asc" },
+  });
+  return rows.map((r) => ({ effectiveFrom: r.effectiveFrom, amount: r.monthlySalary }));
+}
+
+export async function expenseHistory(shop: string, expenseId: string): Promise<PriceEntry[]> {
+  const rows = await prisma.expenseAmount.findMany({
+    where: { shop, expenseId },
+    orderBy: { effectiveFrom: "asc" },
+  });
+  return rows.map((r) => ({ effectiveFrom: r.effectiveFrom, amount: r.amount }));
+}
+
+export async function allSalaryHistories(shop: string): Promise<Record<string, PriceEntry[]>> {
+  const rows = await prisma.workerSalary.findMany({
+    where: { shop },
+    orderBy: { effectiveFrom: "asc" },
+  });
+  return indexHistory(
+    rows,
+    (r) => r.workerId,
+    (r) => ({ effectiveFrom: r.effectiveFrom, amount: r.monthlySalary }),
+  );
+}
+
+export async function allExpenseHistories(shop: string): Promise<Record<string, PriceEntry[]>> {
+  const rows = await prisma.expenseAmount.findMany({
+    where: { shop },
+    orderBy: { effectiveFrom: "asc" },
+  });
+  return indexHistory(
+    rows,
+    (r) => r.expenseId,
+    (r) => ({ effectiveFrom: r.effectiveFrom, amount: r.amount }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Seeding
 // ---------------------------------------------------------------------------
 

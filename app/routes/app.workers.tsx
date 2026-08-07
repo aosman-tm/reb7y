@@ -21,6 +21,16 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
+import { setSalaryTimeline, allSalaryHistories } from "../lib/costHistory.server";
+import {
+  fromEditorModel,
+  toEditorModel,
+  parseEditorModel,
+  EARLIEST_DAY,
+  type PriceEditorModel,
+  type PriceEntry,
+} from "../lib/priceTimeline";
+import { PriceRowsEditor } from "../components/PriceRowsEditor";
 import { parseAmount, formatMoney, round2 } from "../lib/money";
 import { todayString } from "../lib/dates";
 
@@ -32,15 +42,25 @@ const PAYMENT_TYPES = [
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const [workers, settings] = await Promise.all([
+  const [workers, settings, salaryHistories] = await Promise.all([
     prisma.worker.findMany({
       where: { shop: session.shop },
       orderBy: { createdAt: "asc" },
       include: { payments: { orderBy: { createdAt: "desc" }, take: 30 } },
     }),
     getSettings(session.shop),
+    allSalaryHistories(session.shop),
   ]);
-  return { workers, currency: settings.currency, today: todayString() };
+  return {
+    workers: workers.map((w) => ({
+      ...w,
+      // Past salaries, so the edit form shows the whole history.
+      salaryHistory:
+        salaryHistories[w.id] ?? [{ effectiveFrom: EARLIEST_DAY, amount: w.monthlySalary }],
+    })),
+    currency: settings.currency,
+    today: todayString(),
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -53,16 +73,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const name = String(form.get("name") ?? "").trim();
     if (!name) return { error: "Name is required." };
     const ageRaw = String(form.get("age") ?? "").trim();
+    // The salary arrives as a whole timeline: what it is now, plus any earlier
+    // periods where it was different. A raise must not restate past payroll.
+    const model = parseEditorModel(form.get("salary"));
+    const entries = fromEditorModel(model, EARLIEST_DAY);
     const data = {
       name,
       age: ageRaw ? Math.round(Number(ageRaw)) : null,
-      monthlySalary: parseAmount(form.get("monthlySalary")),
+      monthlySalary: model.current,
       note: String(form.get("note") ?? "").trim() || null,
     };
     if (intent === "createWorker") {
-      await prisma.worker.create({ data: { shop, ...data } });
+      const created = await prisma.worker.create({ data: { shop, ...data } });
+      await setSalaryTimeline({ shop, workerId: created.id, entries });
     } else {
-      await prisma.worker.updateMany({ where: { id: String(form.get("id")), shop }, data });
+      const id = String(form.get("id"));
+      await prisma.worker.updateMany({ where: { id, shop }, data });
+      await setSalaryTimeline({ shop, workerId: id, entries });
     }
     return { ok: true };
   }
@@ -122,6 +149,7 @@ type Worker = {
   active: boolean;
   note: string | null;
   payments: Payment[];
+  salaryHistory: PriceEntry[];
 };
 
 function loggedAt(iso: string) {
@@ -145,7 +173,7 @@ export default function WorkersPage() {
   const [workerModal, setWorkerModal] = useState<Worker | "new" | null>(null);
   const [name, setName] = useState("");
   const [age, setAge] = useState("");
-  const [salary, setSalary] = useState("");
+  const [salary, setSalary] = useState<PriceEditorModel>({ current: 0, periods: [] });
   const [wnote, setWnote] = useState("");
 
   // Payment modal
@@ -159,14 +187,15 @@ export default function WorkersPage() {
     setWorkerModal("new");
     setName("");
     setAge("");
-    setSalary("");
+    setSalary({ current: 0, periods: [] });
     setWnote("");
   };
   const openEditWorker = (w: Worker) => {
     setWorkerModal(w);
     setName(w.name);
     setAge(w.age != null ? String(w.age) : "");
-    setSalary(String(w.monthlySalary));
+    // Show every salary ever recorded, not just the current one.
+    setSalary(toEditorModel(w.salaryHistory, today, EARLIEST_DAY));
     setWnote(w.note ?? "");
   };
   const submitWorker = () => {
@@ -176,7 +205,7 @@ export default function WorkersPage() {
         ...(workerModal !== "new" && workerModal ? { id: workerModal.id } : {}),
         name,
         age,
-        monthlySalary: salary || "0",
+        salary: JSON.stringify(salary),
         note: wnote,
       },
       { method: "post" },
@@ -382,17 +411,15 @@ export default function WorkersPage() {
                   min={0}
                   max={120}
                 />
-                <TextField
-                  label="Monthly salary"
-                  type="number"
-                  value={salary}
-                  onChange={setSalary}
-                  autoComplete="off"
-                  prefix={currency}
-                  min={0}
-                  step={0.01}
-                />
               </InlineGrid>
+              <PriceRowsEditor
+                label="Monthly salary"
+                helpText="What you pay this person per month right now."
+                model={salary}
+                onChange={setSalary}
+                currency={currency}
+                today={today}
+              />
               <TextField
                 label="Note (optional)"
                 value={wnote}

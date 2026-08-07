@@ -20,7 +20,17 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../lib/settings.server";
-import { parseAmount, formatMoney, round2 } from "../lib/money";
+import { setExpenseTimeline, allExpenseHistories } from "../lib/costHistory.server";
+import {
+  fromEditorModel,
+  toEditorModel,
+  parseEditorModel,
+  EARLIEST_DAY,
+  type PriceEditorModel,
+  type PriceEntry,
+} from "../lib/priceTimeline";
+import { PriceRowsEditor } from "../components/PriceRowsEditor";
+import { formatMoney, round2 } from "../lib/money";
 import { todayString } from "../lib/dates";
 
 const CATEGORIES = [
@@ -38,11 +48,20 @@ const FREQUENCIES = [
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const [expenses, settings] = await Promise.all([
+  const [expenses, settings, amountHistories] = await Promise.all([
     prisma.expense.findMany({ where: { shop: session.shop }, orderBy: { createdAt: "desc" } }),
     getSettings(session.shop),
+    allExpenseHistories(session.shop),
   ]);
-  return { expenses, currency: settings.currency, today: todayString() };
+  return {
+    expenses: expenses.map((e) => ({
+      ...e,
+      // Past amounts, so the edit form shows the whole history.
+      amountHistory: amountHistories[e.id] ?? [{ effectiveFrom: EARLIEST_DAY, amount: e.amount }],
+    })),
+    currency: settings.currency,
+    today: todayString(),
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -70,10 +89,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!label) return { error: "Give it a name." };
     const frequency = String(form.get("frequency") ?? "monthly");
     const dayRaw = String(form.get("dayOfMonth") ?? "").trim();
+    // The amount arrives as a whole timeline: what it is now, plus any earlier
+    // periods where it was different. A rent increase must not restate the
+    // months before it happened.
+    const model = parseEditorModel(form.get("amountModel"));
+    const entries = fromEditorModel(model, EARLIEST_DAY);
     const data = {
       label,
       category: String(form.get("category") ?? "other"),
-      amount: parseAmount(form.get("amount")),
+      amount: model.current,
       frequency,
       date: frequency === "once" ? String(form.get("date") ?? "") || null : null,
       dayOfMonth: frequency === "monthly" && dayRaw ? Math.round(Number(dayRaw)) : null,
@@ -81,9 +105,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       active: form.get("active") !== "false",
     };
     if (intent === "create") {
-      await prisma.expense.create({ data: { shop, ...data } });
+      const created = await prisma.expense.create({ data: { shop, ...data } });
+      await setExpenseTimeline({ shop, expenseId: created.id, entries });
     } else {
-      await prisma.expense.updateMany({ where: { id: String(form.get("id")), shop }, data });
+      const id = String(form.get("id"));
+      await prisma.expense.updateMany({ where: { id, shop }, data });
+      await setExpenseTimeline({ shop, expenseId: id, entries });
     }
     return { ok: true };
   }
@@ -114,6 +141,7 @@ type Expense = {
   dayOfMonth: number | null;
   note: string | null;
   active: boolean;
+  amountHistory: PriceEntry[];
 };
 
 const CATEGORY_TONE: Record<string, "info" | "warning" | "critical" | undefined> = {
@@ -130,7 +158,7 @@ export default function ExpensesPage() {
   const [editing, setEditing] = useState<Expense | "new" | null>(null);
   const [label, setLabel] = useState("");
   const [category, setCategory] = useState("subscription");
-  const [amount, setAmount] = useState("");
+  const [amount, setAmount] = useState<PriceEditorModel>({ current: 0, periods: [] });
   const [frequency, setFrequency] = useState("monthly");
   const [date, setDate] = useState(today);
   const [dayOfMonth, setDayOfMonth] = useState("");
@@ -140,7 +168,7 @@ export default function ExpensesPage() {
     setEditing("new");
     setLabel("");
     setCategory("subscription");
-    setAmount("");
+    setAmount({ current: 0, periods: [] });
     setFrequency("monthly");
     setDate(today);
     setDayOfMonth("");
@@ -150,7 +178,8 @@ export default function ExpensesPage() {
     setEditing(e);
     setLabel(e.label);
     setCategory(e.category);
-    setAmount(String(e.amount));
+    // Show every amount ever recorded, not just the current one.
+    setAmount(toEditorModel(e.amountHistory, today, EARLIEST_DAY));
     setFrequency(e.frequency);
     setDate(e.date ?? today);
     setDayOfMonth(e.dayOfMonth != null ? String(e.dayOfMonth) : "");
@@ -163,7 +192,7 @@ export default function ExpensesPage() {
         ...(editing !== "new" && editing ? { id: editing.id } : {}),
         label,
         category,
-        amount: amount || "0",
+        amountModel: JSON.stringify(amount),
         frequency,
         date,
         dayOfMonth,
@@ -325,15 +354,13 @@ export default function ExpensesPage() {
                 placeholder="e.g. Shopify plan, Electricity, Fridge repair"
               />
               <Select label="Category" options={CATEGORIES} value={category} onChange={setCategory} />
-              <TextField
+              <PriceRowsEditor
                 label="Amount"
-                type="number"
-                value={amount}
+                helpText="What it costs now."
+                model={amount}
                 onChange={setAmount}
-                autoComplete="off"
-                prefix={currency}
-                min={0}
-                step={0.01}
+                currency={currency}
+                today={today}
               />
               <Select
                 label="How often?"
