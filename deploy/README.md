@@ -55,11 +55,56 @@ sudo -u deploy /srv/reb7y/run-deploy.sh
 The database sits **outside** the code directory on purpose: deploys reset the
 checkout to match GitHub, so anything stored inside it would be destroyed.
 
-### Backing up the database
+## Backups
+
+Shopify holds your orders, but your material costs, recipes, delivery costs,
+expenses and the whole price history live **only** in this database. If it is
+lost it cannot be rebuilt from anywhere.
+
+It is backed up automatically every night at 02:30, and each backup is
+integrity-checked before it is kept — a corrupt backup is worse than none,
+because it looks like safety.
+
+| Where | What | Kept |
+|---|---|---|
+| `/var/backups/reb7y/daily` on the server | nightly | 14 days |
+| `/var/backups/reb7y/weekly` on the server | Sundays | 8 weeks |
+| `C:\shopify\reb7y-backups` on your computer | pulled daily at 19:00 | 60 days |
+
+The copy on your computer is what protects you if the server's disk dies — but
+it only runs while your computer is on. For real safety, add cloud storage
+(see "Still missing" below).
+
+Check it is working:
 
 ```bash
-sqlite3 /var/lib/reb7y/prod.sqlite ".backup '/root/reb7y-$(date +%F).sqlite'"
+systemctl list-timers reb7y-backup.timer   # when it next runs
+journalctl -u reb7y-backup -n 20           # what the last runs did
+ls -lh /var/backups/reb7y/daily            # the backups themselves
 ```
+
+### Restoring
+
+```bash
+systemctl stop reb7y
+cp /var/lib/reb7y/prod.sqlite /var/lib/reb7y/prod.sqlite.before-restore
+gunzip -c /var/backups/reb7y/daily/prod-YYYY-MM-DD.sqlite.gz > /var/lib/reb7y/prod.sqlite
+chown deploy:deploy /var/lib/reb7y/prod.sqlite
+systemctl start reb7y
+```
+
+Always check a backup before trusting it:
+
+```bash
+gunzip -c /var/backups/reb7y/daily/prod-YYYY-MM-DD.sqlite.gz > /tmp/check.sqlite
+sqlite3 /tmp/check.sqlite "PRAGMA integrity_check;"
+sqlite3 /tmp/check.sqlite "SELECT COUNT(*) FROM Material;"
+```
+
+### Still missing
+
+Both copies are in the same city as you. Genuine off-site backup (S3, Backblaze
+B2, Google Drive) still needs an account and credentials.
 
 ## Moving to a real domain
 

@@ -97,9 +97,13 @@ install -m 644 "$APP_DIR/deploy/reb7y.service" /etc/systemd/system/reb7y.service
 install -m 755 -o deploy -g deploy "$APP_DIR/deploy/run-deploy.sh" "$APP_HOME/run-deploy.sh"
 install -m 644 "$APP_DIR/deploy/reb7y-autodeploy.service" /etc/systemd/system/reb7y-autodeploy.service
 install -m 644 "$APP_DIR/deploy/reb7y-autodeploy.timer" /etc/systemd/system/reb7y-autodeploy.timer
+install -m 755 "$APP_DIR/deploy/backup.sh" /usr/local/bin/reb7y-backup
+install -m 644 "$APP_DIR/deploy/reb7y-backup.service" /etc/systemd/system/reb7y-backup.service
+install -m 644 "$APP_DIR/deploy/reb7y-backup.timer" /etc/systemd/system/reb7y-backup.timer
 systemctl daemon-reload
 systemctl enable --quiet reb7y
 systemctl enable --quiet --now reb7y-autodeploy.timer
+systemctl enable --quiet --now reb7y-backup.timer
 
 echo "############ 9. Caddy (automatic HTTPS) ############"
 if ! command -v caddy >/dev/null 2>&1; then

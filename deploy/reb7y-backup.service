@@ -1,0 +1,14 @@
+[Unit]
+Description=Back up the reb7y database
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/reb7y-backup
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reb7y-backup
+
+# A failed backup must be loud, not silent.
+[Install]
+WantedBy=multi-user.target

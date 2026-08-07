@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly reb7y database backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+# If the server was off at 02:30, back up as soon as it is on again rather
+# than skipping the day entirely.
+Persistent=true
+RandomizedDelaySec=5m
+Unit=reb7y-backup.service
+
+[Install]
+WantedBy=timers.target
