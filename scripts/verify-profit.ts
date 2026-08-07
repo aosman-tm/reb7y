@@ -174,5 +174,111 @@ check(
   0,
 );
 
+// ---------------------------------------------------------------------------
+// Bundle line remapping — the real case from order #1038.
+//
+// Shopify sent the Curved Vase's product id but charged the bundle's price of
+// 725. Without a rule the order is costed as a single vase (281.14) and the
+// profit reads ~190 too high.
+// ---------------------------------------------------------------------------
+console.log("\n--- Bundle sold under a component's product id ---");
+
+const VASE = "gid://shopify/Product/8264516239407";
+const BUNDLE = "gid://shopify/Product/8264524562479";
+
+const shopCosts: CostMap = new Map([
+  [VASE, {
+    productId: VASE, title: "Curved Vase",
+    materialCost: 86.14, returnMaterialUnitCost: 0, factoryCost: 195, otherCost: 0,
+    unitCost: 281.14, returnDeliveryMode: "settings", returnDeliveryPercent: 100,
+  }],
+  [BUNDLE, {
+    productId: BUNDLE, title: "Natural Wood Decor Bundle",
+    materialCost: 141.03, returnMaterialUnitCost: 0, factoryCost: 330, otherCost: 0,
+    unitCost: 471.03, returnDeliveryMode: "settings", returnDeliveryPercent: 100,
+  }],
+]);
+
+const bundleSale = order({
+  total: 725,
+  shippingCharged: 0,
+  lineItems: [
+    { productId: VASE, variantId: "gid://shopify/ProductVariant/V1", title: "Curved Vase", quantity: 1, revenue: 725 },
+  ],
+});
+const plainVaseSale = order({
+  total: 450,
+  shippingCharged: 0,
+  lineItems: [
+    { productId: VASE, variantId: "gid://shopify/ProductVariant/V1", title: "Curved Vase", quantity: 1, revenue: 450 },
+  ],
+});
+
+const noRules = { costMap: shopCosts, zones, settings, override: { realDeliveryCost: 0, deliveryOutcome: "delivered", roundTrip: false, depositMode: "none", depositValue: 0, note: null } };
+check(
+  "without a rule the bundle is costed as one vase",
+  computeOrderPnl(bundleSale, noRules).materialsCost,
+  281.14,
+);
+
+// The merchant's rule: "when this sells for 725, it is really the bundle."
+const priceRule = [{ productId: VASE, variantId: null, unitPrice: 725, targetProductId: BUNDLE }];
+const withRule = { ...noRules, lineCostRules: priceRule };
+
+check(
+  "with the rule the bundle costs the bundle",
+  computeOrderPnl(bundleSale, withRule).materialsCost,
+  471.03,
+);
+check(
+  "a normal vase sale at 450 keeps its own cost",
+  computeOrderPnl(plainVaseSale, withRule).materialsCost,
+  281.14,
+);
+check(
+  "the remapped line reports the bundle's title",
+  computeOrderPnl(bundleSale, withRule).lines[0].lineCost,
+  471.03,
+);
+console.log(
+  `   costed as "${computeOrderPnl(bundleSale, withRule).lines[0].costTitle}" ` +
+    `(remapped = ${computeOrderPnl(bundleSale, withRule).lines[0].remapped})`,
+);
+
+// Two of the bundle in one order must double, not stay flat.
+const twoBundles = order({
+  total: 1450,
+  shippingCharged: 0,
+  lineItems: [
+    { productId: VASE, variantId: null, title: "Curved Vase", quantity: 2, revenue: 1450 },
+  ],
+});
+check(
+  "quantity 2 at the same unit price still matches",
+  computeOrderPnl(twoBundles, withRule).materialsCost,
+  942.06,
+);
+
+// A rule with no price applies to every sale of that product.
+const anyPriceRule = [{ productId: VASE, variantId: null, unitPrice: null, targetProductId: BUNDLE }];
+check(
+  "a rule without a price catches the 450 sale too",
+  computeOrderPnl(plainVaseSale, { ...noRules, lineCostRules: anyPriceRule }).materialsCost,
+  471.03,
+);
+
+// The more specific rule must win over the blanket one.
+check(
+  "a price rule beats a blanket rule",
+  computeOrderPnl(plainVaseSale, {
+    ...noRules,
+    lineCostRules: [
+      { productId: VASE, variantId: null, unitPrice: 450, targetProductId: VASE },
+      { productId: VASE, variantId: null, unitPrice: null, targetProductId: BUNDLE },
+    ],
+  }).materialsCost,
+  281.14,
+);
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED ✅" : `${failures} CHECK(S) FAILED ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);

@@ -350,3 +350,26 @@ model WorkerPayment {
   @@index([shop])
   @@index([workerId])
 }
+
+/// "When Shopify sends me this line, cost it as that product instead."
+///
+/// Shopify does not always send a bundle as its own product. A bundle sale can
+/// arrive carrying a component's product id while charging the bundle's price,
+/// which silently costs the order as the component. The merchant owns the
+/// mapping because only they know what they actually sold.
+///
+/// A rule may pin a variant and/or a unit price; the most specific match wins,
+/// so a Curved Vase sold at its own price keeps its own cost.
+model LineCostRule {
+  id              String   @id @default(cuid())
+  shop            String
+  productId       String // the Shopify product GID that arrives on the order line
+  variantId       String? // optional: only this variant
+  unitPrice       Float? // optional: only when sold at this price per unit
+  targetProductId String // the ProductCost.productId to charge instead
+  label           String   @default("") // human note, e.g. "Natural Wood Decor Bundle"
+  createdAt       DateTime @default(now())
+
+  @@unique([shop, productId, variantId, unitPrice])
+  @@index([shop])
+}

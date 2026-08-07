@@ -31,15 +31,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
   const range = resolveRange(url.searchParams.get("range") ?? "all");
-  const [report, settings] = await Promise.all([
+  const [report, settings, costedProducts, rules] = await Promise.all([
     buildReport(admin, session.shop, range.start, range.end),
     getSettings(session.shop),
+    prisma.productCost.findMany({
+      where: { shop: session.shop },
+      select: { productId: true, title: true },
+      orderBy: { title: "asc" },
+    }),
+    prisma.lineCostRule.findMany({ where: { shop: session.shop } }),
   ]);
   return {
     report,
     rangePreset: range.preset,
     settingsDepositMode: settings.depositMode,
     settingsDepositValue: settings.depositValue,
+    costedProducts,
+    rules,
   };
 };
 
@@ -52,6 +60,44 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (intent === "reset") {
     await prisma.orderCost.deleteMany({ where: { shop, orderId } });
+    return { ok: true };
+  }
+
+  // "This line is really my bundle" — remap what Shopify sends to the cost the
+  // merchant means. Scoped by price when they ask for it, so the same product
+  // sold normally keeps its own cost.
+  if (intent === "mapLine") {
+    const productId = String(form.get("productId") ?? "");
+    const targetProductId = String(form.get("targetProductId") ?? "");
+    if (!productId || !targetProductId) return { error: "Pick a product." };
+    const byPrice = form.get("byPrice") === "true";
+    const unitPrice = byPrice ? parseAmount(form.get("unitPrice"), 0) : null;
+    const variantId = String(form.get("variantId") ?? "").trim() || null;
+
+    if (targetProductId === productId) {
+      // Choosing the original product back means "stop remapping".
+      await prisma.lineCostRule.deleteMany({ where: { shop, productId, variantId, unitPrice } });
+      return { ok: true };
+    }
+
+    const data = { targetProductId, label: String(form.get("label") ?? "").trim() };
+    const existing = await prisma.lineCostRule.findFirst({
+      where: { shop, productId, variantId, unitPrice },
+    });
+    if (existing) {
+      await prisma.lineCostRule.update({ where: { id: existing.id }, data });
+    } else {
+      await prisma.lineCostRule.create({
+        data: { shop, productId, variantId, unitPrice, ...data },
+      });
+    }
+    return { ok: true };
+  }
+
+  if (intent === "unmapLine") {
+    await prisma.lineCostRule.deleteMany({
+      where: { shop, id: String(form.get("ruleId") ?? "") },
+    });
     return { ok: true };
   }
 
@@ -164,8 +210,143 @@ function MathRow({
   );
 }
 
+type CostedProduct = { productId: string; title: string };
+type Rule = {
+  id: string;
+  productId: string;
+  variantId: string | null;
+  unitPrice: number | null;
+  targetProductId: string;
+};
+
+/**
+ * "This line is really my bundle."
+ *
+ * Shopify can send a bundle sale carrying a component's product id, so the app
+ * cannot tell the two apart on its own — but the merchant can, and the price it
+ * sold at is usually the giveaway. Pinning the rule to that price keeps the
+ * same product sold normally on its own cost.
+ */
+function LineCostMapper({
+  line,
+  currency,
+  costedProducts,
+  rules,
+}: {
+  line: OrderPnl["lines"][number];
+  currency: string;
+  costedProducts: CostedProduct[];
+  rules: Rule[];
+}) {
+  const fetcher = useFetcher();
+  const [open, setOpen] = useState(false);
+
+  const existing =
+    rules
+      .filter(
+        (r) =>
+          r.productId === line.productId &&
+          (!r.variantId || r.variantId === line.variantId) &&
+          (r.unitPrice == null || Math.abs(r.unitPrice - line.unitPrice) <= 0.01),
+      )
+      .sort(
+        (a, b) =>
+          (b.variantId ? 2 : 0) +
+          (b.unitPrice != null ? 1 : 0) -
+          ((a.variantId ? 2 : 0) + (a.unitPrice != null ? 1 : 0)),
+      )[0] ?? null;
+
+  const [target, setTarget] = useState(existing?.targetProductId ?? line.productId ?? "");
+  const [byPrice, setByPrice] = useState(existing ? existing.unitPrice != null : true);
+
+  if (!line.productId) return null;
+
+  const options = [
+    ...(costedProducts.some((p) => p.productId === line.productId)
+      ? []
+      : [{ label: line.title, value: line.productId }]),
+    ...costedProducts.map((p) => ({
+      label: p.productId === line.productId ? `${p.title} (what Shopify sent)` : p.title,
+      value: p.productId,
+    })),
+  ];
+
+  const dirty =
+    target !== (existing?.targetProductId ?? line.productId) ||
+    byPrice !== (existing ? existing.unitPrice != null : true);
+
+  if (!open) {
+    return (
+      <InlineStack gap="200" blockAlign="center">
+        <Button variant="plain" onClick={() => setOpen(true)}>
+          {line.remapped ? "Change what this is costed as" : "Wrong product? Cost it as…"}
+        </Button>
+        {line.remapped && existing && (
+          <Button
+            variant="plain"
+            tone="critical"
+            onClick={() =>
+              fetcher.submit({ _action: "unmapLine", ruleId: existing.id }, { method: "post" })
+            }
+          >
+            Remove rule
+          </Button>
+        )}
+      </InlineStack>
+    );
+  }
+
+  return (
+    <Box padding="300" background="bg-surface" borderRadius="200">
+      <BlockStack gap="300">
+        <Select
+          label="Charge the cost of"
+          options={options}
+          value={target}
+          onChange={setTarget}
+        />
+        <Checkbox
+          label={`Only when this item sells for ${formatMoney(line.unitPrice, currency)}`}
+          checked={byPrice}
+          onChange={setByPrice}
+          helpText={
+            byPrice
+              ? "Recommended. The same product sold at any other price keeps its own cost."
+              : "Every sale of this item will use the cost above, whatever the price."
+          }
+        />
+        <InlineStack gap="200">
+          <Button
+            variant="primary"
+            disabled={!dirty}
+            loading={fetcher.state !== "idle"}
+            onClick={() => {
+              fetcher.submit(
+                {
+                  _action: "mapLine",
+                  productId: line.productId ?? "",
+                  variantId: "",
+                  unitPrice: String(line.unitPrice),
+                  byPrice: String(byPrice),
+                  targetProductId: target,
+                  label: line.title,
+                },
+                { method: "post" },
+              );
+              setOpen(false);
+            }}
+          >
+            Save
+          </Button>
+          <Button onClick={() => setOpen(false)}>Cancel</Button>
+        </InlineStack>
+      </BlockStack>
+    </Box>
+  );
+}
+
 export default function OrdersPage() {
-  const { report, rangePreset, settingsDepositMode, settingsDepositValue } =
+  const { report, rangePreset, settingsDepositMode, settingsDepositValue, costedProducts, rules } =
     useLoaderData<typeof loader>();
   const [searchParams] = useSearchParams();
   const fetcher = useFetcher<typeof action>();
@@ -176,8 +357,13 @@ export default function OrdersPage() {
     filter === "all" ? true : filter === "issues" ? !o.delivered : o.delivered,
   );
 
-  // --- Read-only detail modal ---
-  const [viewing, setViewing] = useState<OrderPnl | null>(null);
+  // --- Detail modal. Held by id, not by value, so the numbers refresh in place
+  // when a cost mapping is saved from inside it. ---
+  const [viewingId, setViewingId] = useState<string | null>(null);
+  const viewing = viewingId
+    ? (report.orders.find((o) => o.orderId === viewingId) ?? null)
+    : null;
+  const setViewing = (order: OrderPnl | null) => setViewingId(order?.orderId ?? null);
 
   // --- Editor modal state ---
   const [editing, setEditing] = useState<OrderPnl | null>(null);
@@ -529,11 +715,10 @@ export default function OrdersPage() {
                               −{formatMoney(line.lineCost, currency)}
                             </Text>
                           </InlineStack>
-                          {line.costTitle !== line.title && (
-                            <Text as="span" tone="caution" variant="bodySm">
-                              Shopify sent this line as “{line.title}”, so it was costed using your
-                              “{line.costTitle}” product. If this order was really a different
-                              product or a bundle, add a cost for what Shopify actually sends.
+                          {line.remapped && (
+                            <Text as="span" tone="success" variant="bodySm">
+                              Your rule: sold at {formatMoney(line.unitPrice, currency)}, so it is
+                              costed as “{line.costTitle}”.
                             </Text>
                           )}
                           {!viewing.delivered && (
@@ -550,8 +735,16 @@ export default function OrdersPage() {
                       )}
 
                       <Text as="span" tone="subdued" variant="bodySm">
-                        Shopify product {line.productId?.split("/").pop() ?? "— none sent"}
+                        Sold at {formatMoney(line.unitPrice, currency)} each · Shopify product{" "}
+                        {line.productId?.split("/").pop() ?? "— none sent"}
                       </Text>
+
+                      <LineCostMapper
+                        line={line}
+                        currency={currency}
+                        costedProducts={costedProducts}
+                        rules={rules}
+                      />
                     </BlockStack>
                   </Box>
                 ))

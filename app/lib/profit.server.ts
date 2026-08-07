@@ -78,12 +78,59 @@ export type OrderPnlLine = {
   title: string; // what Shopify called it on the order
   quantity: number;
   revenue: number;
-  productId: string | null;
+  productId: string | null; // what Shopify sent
+  variantId: string | null;
+  unitPrice: number; // what one unit sold for
+  costProductId: string | null; // which product's cost was charged
   costTitle: string | null; // the product cost record this line matched
   unitCost: number; // cost applied per unit on this order's date
   lineCost: number; // unitCost * quantity
   hasCost: boolean; // false = no recipe, counted as zero cost
+  remapped: boolean; // true when a merchant rule redirected the cost
 };
+
+/** A merchant-owned mapping from what Shopify sends to which cost to charge. */
+export type LineCostRule = {
+  productId: string;
+  variantId: string | null;
+  unitPrice: number | null;
+  targetProductId: string;
+};
+
+/** What one unit of a line sold for, which is how a bundle sale gives itself
+ * away when it arrives carrying a component's product id. */
+export function lineUnitPrice(line: NormalizedLineItem): number {
+  return line.quantity > 0 ? round2(line.revenue / line.quantity) : round2(line.revenue);
+}
+
+/**
+ * Which product's cost this line should be charged at.
+ *
+ * The most specific rule wins — a rule pinned to a variant AND a price beats
+ * one pinned to the price alone — so mapping a bundle sale never disturbs the
+ * same product sold normally at its own price.
+ */
+export function resolveLineCostProductId(
+  line: NormalizedLineItem,
+  rules: LineCostRule[],
+): string | null {
+  if (!line.productId) return null;
+  const unit = lineUnitPrice(line);
+
+  let bestTarget = line.productId;
+  let bestScore = -1;
+  for (const rule of rules) {
+    if (rule.productId !== line.productId) continue;
+    if (rule.variantId && rule.variantId !== line.variantId) continue;
+    if (rule.unitPrice != null && Math.abs(rule.unitPrice - unit) > 0.01) continue;
+    const score = (rule.variantId ? 2 : 0) + (rule.unitPrice != null ? 1 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      bestTarget = rule.targetProductId;
+    }
+  }
+  return bestTarget;
+}
 
 export type OrderPnl = {
   orderId: string;
@@ -382,6 +429,7 @@ export function computeOrderPnl(
     zones: Zone[];
     settings: ShopSettings;
     override?: OrderOverride | null;
+    lineCostRules?: LineCostRule[];
   },
 ): OrderPnl {
   const { costMap, zones, settings, override } = ctx;
@@ -393,7 +441,10 @@ export function computeOrderPnl(
   let missingCost = false;
   const lines: OrderPnlLine[] = [];
   for (const line of order.lineItems) {
-    const cost = line.productId ? costMap.get(line.productId) : undefined;
+    // A merchant rule can redirect this line to a different product's cost —
+    // see resolveLineCostProductId for why that is needed at all.
+    const costProductId = resolveLineCostProductId(line, ctx.lineCostRules ?? []);
+    const cost = costProductId ? costMap.get(costProductId) : undefined;
     const unitCost = cost ? (delivered ? cost.unitCost : cost.returnMaterialUnitCost) : 0;
     const lineCost = unitCost * line.quantity;
     if (!cost) missingCost = true;
@@ -403,10 +454,14 @@ export function computeOrderPnl(
       quantity: line.quantity,
       revenue: round2(line.revenue),
       productId: line.productId,
+      variantId: line.variantId,
+      unitPrice: lineUnitPrice(line),
+      costProductId,
       costTitle: cost?.title ?? null,
       unitCost: round2(unitCost),
       lineCost: round2(lineCost),
       hasCost: Boolean(cost),
+      remapped: Boolean(costProductId && costProductId !== line.productId),
     });
   }
 
@@ -660,6 +715,7 @@ export async function buildReport(
     paymentRows,
     salaryHistories,
     expenseHistories,
+    lineCostRules,
     fetched,
   ] = await Promise.all([
     loadCostTimeline(shop),
@@ -675,6 +731,7 @@ export async function buildReport(
     }),
     allSalaryHistories(shop),
     allExpenseHistories(shop),
+    prisma.lineCostRule.findMany({ where: { shop } }),
     fetchOrders(admin, startDay, endDay),
   ]);
 
@@ -706,6 +763,7 @@ export async function buildReport(
       zones: timeline.zonesAt(dayOf(o)),
       settings: { ...settings, ...rulesAt(dayOf(o)) },
       override: overrideMap.get(o.id),
+      lineCostRules,
     }),
   );
   const orderPnlMap = new Map(orders.map((o) => [o.orderId, o]));
@@ -723,15 +781,18 @@ export async function buildReport(
     const orderCostMap = timeline.costMapAt(dayOf(order));
 
     for (const line of order.lineItems) {
-      const key = line.productId ?? `title:${line.title}`;
-      const cost = line.productId ? orderCostMap.get(line.productId) : undefined;
+      // Same remapping as the order P&L, so a bundle shows up under the bundle
+      // in Reports instead of splitting away from the orders table.
+      const costProductId = resolveLineCostProductId(line, lineCostRules);
+      const key = costProductId ?? `title:${line.title}`;
+      const cost = costProductId ? orderCostMap.get(costProductId) : undefined;
       const shareByRevenue = totalLineRevenue > 0 ? line.revenue / totalLineRevenue : 0;
       const shareByQty = totalQty > 0 ? line.quantity / totalQty : 0;
       const allocationShare = shareByRevenue > 0 ? shareByRevenue : shareByQty;
       const existing =
         productAcc.get(key) ??
         {
-          productId: line.productId,
+          productId: costProductId,
           title: cost?.title || line.title,
           units: 0,
           revenue: 0,
