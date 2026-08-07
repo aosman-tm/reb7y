@@ -324,6 +324,11 @@ export default function OrdersPage() {
                           </Badge>
                         )}
                       </InlineStack>
+                      {o.customerName && (
+                        <Text as="span" variant="bodySm">
+                          {o.customerName}
+                        </Text>
+                      )}
                       <Text as="span" tone="subdued" variant="bodySm">
                         {shortDate(o.createdAt)}
                         {o.city ? ` · ${o.city}` : ""}
@@ -456,6 +461,11 @@ export default function OrdersPage() {
         >
           <Modal.Section>
             <BlockStack gap="200">
+              {viewing.customerName && (
+                <Text as="p" variant="headingSm">
+                  {viewing.customerName}
+                </Text>
+              )}
               <InlineStack gap="150" blockAlign="center">
                 {viewing.isCOD && <Badge size="small">COD</Badge>}
                 <Badge size="small" tone={viewing.delivered ? "success" : "critical"}>
@@ -538,6 +548,10 @@ export default function OrdersPage() {
                           so the profit below is too high.
                         </Text>
                       )}
+
+                      <Text as="span" tone="subdued" variant="bodySm">
+                        Shopify product {line.productId?.split("/").pop() ?? "— none sent"}
+                      </Text>
                     </BlockStack>
                   </Box>
                 ))

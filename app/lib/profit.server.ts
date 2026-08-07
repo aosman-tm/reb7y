@@ -55,6 +55,7 @@ export type NormalizedOrder = {
   shippingCharged: number; // what the customer was charged for shipping
   discounts: number;
   refunds: number;
+  customerName: string | null; // from the shipping address; null if not approved
   city: string | null;
   province: string | null;
   country: string | null;
@@ -119,6 +120,7 @@ export type OrderPnl = {
   note: string | null;
   hasOverride: boolean;
   missingCost: boolean; // at least one product in the order has no cost defined
+  customerName: string | null;
   city: string | null;
   province: string | null;
 };
@@ -489,6 +491,7 @@ export function computeOrderPnl(
     note: override?.note ?? null,
     hasOverride: Boolean(override),
     missingCost,
+    customerName: order.customerName,
     city: order.city,
     province: order.province,
   };
@@ -498,7 +501,12 @@ export function computeOrderPnl(
 // Shopify order fetching
 // ---------------------------------------------------------------------------
 
-const ORDERS_QUERY = `#graphql
+/**
+ * The customer's name lives behind Shopify's protected-fields approval, which a
+ * shop may not have. `withCustomerName: false` drops it so a shop without that
+ * approval still gets its orders instead of an error page.
+ */
+const buildOrdersQuery = (withCustomerName: boolean) => `#graphql
   query Reb7yOrders($first: Int!, $after: String, $query: String!) {
     orders(first: $first, after: $after, query: $query, sortKey: CREATED_AT, reverse: true) {
       edges {
@@ -515,7 +523,7 @@ const ORDERS_QUERY = `#graphql
           totalShippingPriceSet { shopMoney { amount } }
           totalDiscountsSet { shopMoney { amount } }
           totalRefundedSet { shopMoney { amount } }
-          shippingAddress { city province country }
+          shippingAddress { ${withCustomerName ? "name" : ""} city province country }
           lineItems(first: 100) {
             edges {
               node {
@@ -541,6 +549,16 @@ function money(bag: any): number {
 
 const MAX_PAGES = 100; // safety cap: up to 100 * 100 = 10,000 orders per report
 
+/** True when Shopify rejected the query because of protected customer fields. */
+function mentionsProtectedField(errors: unknown): boolean {
+  const text = JSON.stringify(errors ?? "").toLowerCase();
+  return (
+    text.includes("protected customer data") ||
+    text.includes("protected_customer_data") ||
+    (text.includes("name") && text.includes("access denied"))
+  );
+}
+
 /** Fetch and normalize all orders created within [startDay, endDay] (inclusive). */
 export async function fetchOrders(
   admin: GraphqlClient,
@@ -551,12 +569,25 @@ export async function fetchOrders(
   const orders: NormalizedOrder[] = [];
   let after: string | null = null;
   let truncated = false;
+  let withCustomerName = true;
+
+  const requestPage = async (cursor: string | null, includeName: boolean): Promise<any> => {
+    const response = await admin.graphql(buildOrdersQuery(includeName), {
+      variables: { first: 100, after: cursor, query },
+    });
+    return await response.json();
+  };
 
   for (let page = 0; page < MAX_PAGES; page++) {
-    const response = await admin.graphql(ORDERS_QUERY, {
-      variables: { first: 100, after, query },
-    });
-    const body: any = await response.json();
+    let body: any = await requestPage(after, withCustomerName);
+
+    // The name field needs Shopify's protected-fields approval. Losing every
+    // order because of it would be a bad trade, so drop the name and retry.
+    if (body?.errors && withCustomerName && mentionsProtectedField(body.errors)) {
+      withCustomerName = false;
+      body = await requestPage(after, withCustomerName);
+    }
+
     if (body?.errors) {
       const msg = Array.isArray(body.errors)
         ? body.errors.map((e: any) => e.message).join("; ")
@@ -583,6 +614,7 @@ export async function fetchOrders(
         shippingCharged: money(node.totalShippingPriceSet),
         discounts: money(node.totalDiscountsSet),
         refunds: money(node.totalRefundedSet),
+        customerName: node.shippingAddress?.name?.trim() || null,
         city: node.shippingAddress?.city ?? null,
         province: node.shippingAddress?.province ?? null,
         country: node.shippingAddress?.country ?? null,

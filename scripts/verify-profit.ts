@@ -67,6 +67,7 @@ function order(overrides: Partial<NormalizedOrder>): NormalizedOrder {
     shippingCharged: 40,
     discounts: 0,
     refunds: 0,
+    customerName: "Test Customer",
     city: "Nasr City",
     province: "Cairo",
     country: "Egypt",
