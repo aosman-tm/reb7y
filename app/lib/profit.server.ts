@@ -70,10 +70,25 @@ export type OrderOverride = {
   note: string | null;
 };
 
+/** One line of an order, with the cost that was actually applied to it.
+ * Kept on the P&L so the order detail view can show WHY a number came out the
+ * way it did — a total on its own can't tell you it costed the wrong product. */
+export type OrderPnlLine = {
+  title: string; // what Shopify called it on the order
+  quantity: number;
+  revenue: number;
+  productId: string | null;
+  costTitle: string | null; // the product cost record this line matched
+  unitCost: number; // cost applied per unit on this order's date
+  lineCost: number; // unitCost * quantity
+  hasCost: boolean; // false = no recipe, counted as zero cost
+};
+
 export type OrderPnl = {
   orderId: string;
   name: string;
   createdAt: string;
+  lines: OrderPnlLine[];
   outcome: string;
   isCOD: boolean;
   delivered: boolean;
@@ -88,6 +103,8 @@ export type OrderPnl = {
   courierNetLoss: number; // realDelivery - depositCollected (negative means courier-side gain)
   deliveryGap: number; // shippingCharged - realDelivery (negative = you lose on shipping)
   paymentFee: number;
+  paymentFeePercent: number; // the rate that applied on this order's own date
+  paymentFeeFlat: number;
   discounts: number;
   refunds: number;
   profit: number; // revenue + depositCollected - materials - realDelivery - paymentFee (BEFORE ad spend)
@@ -372,13 +389,23 @@ export function computeOrderPnl(
   // --- Materials: delivered uses full unit cost; returned/rejected can include only selected materials. ---
   let materialsCost = 0;
   let missingCost = false;
+  const lines: OrderPnlLine[] = [];
   for (const line of order.lineItems) {
     const cost = line.productId ? costMap.get(line.productId) : undefined;
-    if (!cost) {
-      missingCost = true;
-      continue;
-    }
-    materialsCost += (delivered ? cost.unitCost : cost.returnMaterialUnitCost) * line.quantity;
+    const unitCost = cost ? (delivered ? cost.unitCost : cost.returnMaterialUnitCost) : 0;
+    const lineCost = unitCost * line.quantity;
+    if (!cost) missingCost = true;
+    materialsCost += lineCost;
+    lines.push({
+      title: line.title,
+      quantity: line.quantity,
+      revenue: round2(line.revenue),
+      productId: line.productId,
+      costTitle: cost?.title ?? null,
+      unitCost: round2(unitCost),
+      lineCost: round2(lineCost),
+      hasCost: Boolean(cost),
+    });
   }
 
   // --- Real delivery cost: per-order override first, then matched zone, then Shopify shipping fallback. ---
@@ -431,6 +458,7 @@ export function computeOrderPnl(
     orderId: order.id,
     name: order.name,
     createdAt: order.createdAt,
+    lines,
     outcome,
     isCOD: order.isCOD,
     delivered,
@@ -445,6 +473,8 @@ export function computeOrderPnl(
     courierNetLoss: round2(courierNetLoss),
     deliveryGap: round2(order.shippingCharged - realDelivery),
     paymentFee: round2(paymentFee),
+    paymentFeePercent: feePercent,
+    paymentFeeFlat: settings.paymentFeeFlat,
     discounts: round2(order.discounts),
     refunds: round2(order.refunds),
     profit: round2(profit),

@@ -112,6 +112,58 @@ function shortDate(iso: string) {
   }
 }
 
+function longDate(iso: string) {
+  try {
+    return new Date(iso).toLocaleDateString(undefined, {
+      day: "2-digit",
+      month: "long",
+      year: "numeric",
+    });
+  } catch {
+    return iso.slice(0, 10);
+  }
+}
+
+/** One line of the profit calculation, so the modal reads like a receipt. */
+function MathRow({
+  label,
+  hint,
+  value,
+  currency,
+  sign,
+  strong,
+}: {
+  label: string;
+  hint?: string;
+  value: number;
+  currency: string;
+  sign: "+" | "-" | "=";
+  strong?: boolean;
+}) {
+  return (
+    <InlineStack align="space-between" blockAlign="start" gap="400" wrap={false}>
+      <BlockStack gap="050">
+        <Text as="span" fontWeight={strong ? "semibold" : "regular"}>
+          {label}
+        </Text>
+        {hint && (
+          <Text as="span" tone="subdued" variant="bodySm">
+            {hint}
+          </Text>
+        )}
+      </BlockStack>
+      <Text
+        as="span"
+        fontWeight={strong ? "semibold" : "regular"}
+        tone={sign === "-" ? "critical" : sign === "=" ? undefined : "success"}
+      >
+        {sign === "=" ? "" : sign}
+        {formatMoney(value, currency)}
+      </Text>
+    </InlineStack>
+  );
+}
+
 export default function OrdersPage() {
   const { report, rangePreset, settingsDepositMode, settingsDepositValue } =
     useLoaderData<typeof loader>();
@@ -123,6 +175,9 @@ export default function OrdersPage() {
   const orders = report.orders.filter((o) =>
     filter === "all" ? true : filter === "issues" ? !o.delivered : o.delivered,
   );
+
+  // --- Read-only detail modal ---
+  const [viewing, setViewing] = useState<OrderPnl | null>(null);
 
   // --- Editor modal state ---
   const [editing, setEditing] = useState<OrderPnl | null>(null);
@@ -336,9 +391,14 @@ export default function OrdersPage() {
                     </Text>
                   </IndexTable.Cell>
                   <IndexTable.Cell>
-                    <Button size="slim" onClick={() => openEdit(o)}>
-                      Adjust
-                    </Button>
+                    <ButtonGroup variant="segmented">
+                      <Button size="slim" onClick={() => setViewing(o)}>
+                        View
+                      </Button>
+                      <Button size="slim" onClick={() => openEdit(o)}>
+                        Adjust
+                      </Button>
+                    </ButtonGroup>
                   </IndexTable.Cell>
                 </IndexTable.Row>
               ))}
@@ -376,6 +436,232 @@ export default function OrdersPage() {
           </Card>
         )}
       </BlockStack>
+
+      {viewing && (
+        <Modal
+          open
+          onClose={() => setViewing(null)}
+          title={`${viewing.name} · ${longDate(viewing.createdAt)}`}
+          primaryAction={{ content: "Close", onAction: () => setViewing(null) }}
+          secondaryActions={[
+            {
+              content: "Adjust this order",
+              onAction: () => {
+                const order = viewing;
+                setViewing(null);
+                openEdit(order);
+              },
+            },
+          ]}
+        >
+          <Modal.Section>
+            <BlockStack gap="200">
+              <InlineStack gap="150" blockAlign="center">
+                {viewing.isCOD && <Badge size="small">COD</Badge>}
+                <Badge size="small" tone={viewing.delivered ? "success" : "critical"}>
+                  {viewing.delivered
+                    ? "Delivered"
+                    : viewing.outcome === "rejected"
+                      ? "Rejected"
+                      : "Returned"}
+                </Badge>
+                {viewing.city && <Badge size="small">{viewing.city}</Badge>}
+                {viewing.hasOverride && (
+                  <Badge size="small" tone="info">
+                    Manually adjusted
+                  </Badge>
+                )}
+              </InlineStack>
+              <Text as="p" tone="subdued" variant="bodySm">
+                Costs below are the ones that applied on {longDate(viewing.createdAt)} — not
+                today's. Changing a price now will not move this order.
+              </Text>
+            </BlockStack>
+          </Modal.Section>
+
+          <Modal.Section>
+            <BlockStack gap="300">
+              <Text as="h3" variant="headingSm">
+                What was in this order
+              </Text>
+
+              {viewing.lines.length === 0 ? (
+                <Text as="p" tone="subdued">
+                  Shopify returned no products for this order.
+                </Text>
+              ) : (
+                viewing.lines.map((line, i) => (
+                  <Box
+                    key={`${line.productId ?? line.title}-${i}`}
+                    padding="300"
+                    background="bg-surface-secondary"
+                    borderRadius="200"
+                  >
+                    <BlockStack gap="150">
+                      <InlineStack align="space-between" gap="400" wrap={false}>
+                        <Text as="span" fontWeight="semibold">
+                          {line.title}
+                          {line.quantity !== 1 ? ` × ${line.quantity}` : ""}
+                        </Text>
+                        <Text as="span" fontWeight="semibold">
+                          {formatMoney(line.revenue, currency)}
+                        </Text>
+                      </InlineStack>
+
+                      {line.hasCost ? (
+                        <BlockStack gap="050">
+                          <InlineStack align="space-between" gap="400" wrap={false}>
+                            <Text as="span" tone="subdued" variant="bodySm">
+                              Costed as “{line.costTitle}” ·{" "}
+                              {formatMoney(line.unitCost, currency)} each
+                            </Text>
+                            <Text as="span" tone="critical" variant="bodySm">
+                              −{formatMoney(line.lineCost, currency)}
+                            </Text>
+                          </InlineStack>
+                          {line.costTitle !== line.title && (
+                            <Text as="span" tone="caution" variant="bodySm">
+                              Shopify sent this line as “{line.title}”, so it was costed using your
+                              “{line.costTitle}” product. If this order was really a different
+                              product or a bundle, add a cost for what Shopify actually sends.
+                            </Text>
+                          )}
+                          {!viewing.delivered && (
+                            <Text as="span" tone="subdued" variant="bodySm">
+                              Not delivered, so only the materials you cannot reuse are counted.
+                            </Text>
+                          )}
+                        </BlockStack>
+                      ) : (
+                        <Text as="span" tone="caution" variant="bodySm">
+                          No cost recipe for this product — counted as {formatMoney(0, currency)},
+                          so the profit below is too high.
+                        </Text>
+                      )}
+                    </BlockStack>
+                  </Box>
+                ))
+              )}
+            </BlockStack>
+          </Modal.Section>
+
+          <Modal.Section>
+            <BlockStack gap="300">
+              <Text as="h3" variant="headingSm">
+                How the profit was calculated
+              </Text>
+
+              <MathRow
+                label="Money from the customer"
+                hint={
+                  viewing.delivered
+                    ? `Order total${viewing.tax > 0 ? `, minus ${formatMoney(viewing.tax, currency)} tax` : ""}${
+                        viewing.shippingCharged > 0
+                          ? `, includes ${formatMoney(viewing.shippingCharged, currency)} shipping`
+                          : ""
+                      }`
+                    : "Not delivered — you kept none of the sale"
+                }
+                value={viewing.revenue}
+                currency={currency}
+                sign="+"
+              />
+
+              {!viewing.delivered && viewing.depositCollected > 0 && (
+                <MathRow
+                  label="Deposit you kept"
+                  hint={viewing.depositRule ?? undefined}
+                  value={viewing.depositCollected}
+                  currency={currency}
+                  sign="+"
+                />
+              )}
+
+              <MathRow
+                label="Product cost"
+                hint={
+                  viewing.lines.length > 0
+                    ? viewing.lines
+                        .map((l) => `${l.costTitle ?? l.title}${l.quantity !== 1 ? ` ×${l.quantity}` : ""}`)
+                        .join(" + ")
+                    : undefined
+                }
+                value={viewing.materialsCost}
+                currency={currency}
+                sign="-"
+              />
+
+              <MathRow
+                label="Courier"
+                hint={`${viewing.realDeliverySourceLabel}${
+                  viewing.roundTrip ? " · counted both ways" : ""
+                }${viewing.returnDeliveryRule ? ` · ${viewing.returnDeliveryRule}` : ""}`}
+                value={viewing.realDelivery}
+                currency={currency}
+                sign="-"
+              />
+
+              <MathRow
+                label="Payment fee"
+                hint={
+                  viewing.paymentFeePercent === 0 && viewing.paymentFeeFlat === 0
+                    ? "No fee set in Settings"
+                    : `${viewing.paymentFeePercent}%${
+                        viewing.paymentFeeFlat > 0
+                          ? ` + ${formatMoney(viewing.paymentFeeFlat, currency)}`
+                          : ""
+                      }${viewing.isCOD ? " (COD rate)" : ""}`
+                }
+                value={viewing.paymentFee}
+                currency={currency}
+                sign="-"
+              />
+
+              <Box borderColor="border" borderBlockStartWidth="025" paddingBlockStart="300">
+                <MathRow
+                  label="Profit on this order"
+                  hint="Before ads, salaries and monthly expenses"
+                  value={viewing.profit}
+                  currency={currency}
+                  sign="="
+                  strong
+                />
+              </Box>
+
+              {viewing.delivered && viewing.shippingCharged !== viewing.realDelivery && (
+                <Text
+                  as="p"
+                  variant="bodySm"
+                  tone={viewing.deliveryGap < 0 ? "critical" : "success"}
+                >
+                  Shipping: charged {formatMoney(viewing.shippingCharged, currency)}, paid{" "}
+                  {formatMoney(viewing.realDelivery, currency)} —{" "}
+                  {viewing.deliveryGap < 0
+                    ? `you lost ${formatMoney(-viewing.deliveryGap, currency)}`
+                    : `you gained ${formatMoney(viewing.deliveryGap, currency)}`}
+                  .
+                </Text>
+              )}
+
+              {viewing.refunds > 0 && (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Refunded to the customer: {formatMoney(viewing.refunds, currency)}.
+                </Text>
+              )}
+              {viewing.discounts > 0 && (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Discounts given: {formatMoney(viewing.discounts, currency)}.
+                </Text>
+              )}
+              {viewing.note && (
+                <Banner tone="info">
+                  <p>{viewing.note}</p>
+                </Banner>
+              )}
+            </BlockStack>
+          </Modal.Section>
+        </Modal>
+      )}
 
       {editing && (
         <Modal
